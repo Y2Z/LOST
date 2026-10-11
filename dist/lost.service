@@ -1,0 +1,40 @@
+# systemd unit for running LOST as a web server.
+# Installed by the .deb (and by `make install`) without being started.
+# Start it, and on every boot from then on:
+#   sudo systemctl enable --now lost
+# To serve the local network, set address = "0.0.0.0" in /etc/lost/lost.toml.
+
+[Unit]
+Description=LOST (Local Offline Search Tool) web server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lost -s
+Restart=on-failure
+DynamicUser=yes
+StateDirectory=lost
+RuntimeDirectory=lost
+ConfigurationDirectory=lost
+# The database goes in /var/lib/lost/.lost (LOST keeps it under $HOME), the
+# single-instance socket in /run/lost.
+Environment=HOME=%S/lost
+Environment=XDG_RUNTIME_DIR=%t/lost
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

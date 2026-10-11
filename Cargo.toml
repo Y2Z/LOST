@@ -1,0 +1,123 @@
+[package]
+name = "lost"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Local Offline Search Tool: an offline search engine for the web"
+license = "0BSD"
+readme = "README.md"
+repository = "https://github.com/Y2Z/LOST"
+keywords = ["search", "offline", "privacy", "search-engine", "full-text"]
+categories = ["command-line-utilities", "text-processing"]
+exclude = ["/.github", "/dist/*.sh", "/dist/Info.plist", "/Makefile"]
+
+[lib]
+name = "lost"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lost"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli", "server", "gui"]
+# The lost binary: argument parsing, CLI output, local-socket IPC.
+cli = ["dep:terminal_size", "dep:libc", "dep:interprocess", "dep:jiff"]
+# Web server, Web API, embedded web UI, -b daemon mode.
+server = ["dep:axum", "dep:tokio", "dep:libc"]
+# egui desktop app and tray icon.
+gui = ["cli", "dep:eframe", "dep:rfd", "dep:ksni", "dep:winit", "dep:tray-icon", "dep:windows-sys"]
+
+[dependencies]
+blake3 = "1"
+csv = "1"
+flate2 = "1"
+redb = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = "0.26"
+toml = "1"
+terminal_size = { version = "0.4", optional = true }
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"], optional = true }
+# glow (OpenGL) rather than eframe's default wgpu: a smaller, quicker build.
+eframe = { version = "0.36", optional = true, default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "links",
+    "persistence",
+    "wayland",
+    "x11",
+] }
+rfd = { version = "0.17", optional = true }
+# Local time in the app and the command line (the system's time zones).
+jiff = { version = "0.2", optional = true }
+# The .lost format (ARCHITECTURE.md §9): compressed chunks, signatures,
+# and randomness for making a signing key.
+zstd = "0.14"
+ed25519-dalek = "3"
+getrandom = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+# Named pipes for the single-instance sockets.
+[target.'cfg(windows)'.dependencies]
+interprocess = { version = "2", optional = true }
+# Letting go of the console window when the desktop app starts.
+windows-sys = { version = "0.61", optional = true, features = ["Win32_System_Console"] }
+
+# The icon in lost.exe (build.rs; only when building on Windows).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"
+
+# Tray icon: StatusNotifierItem over D-Bus on Linux and BSD (no GTK) …
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ksni = { version = "0.3", optional = true, features = ["blocking"] }
+# The same winit eframe uses, for running the window through XWayland. Its
+# default features (X11, Wayland loaded at run time, Wayland window
+# decorations) are what eframe's own defaults would have given it.
+winit = { version = "0.30.13", optional = true }
+
+# … and the system tray on Windows and macOS.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26", optional = true }
+
+# `cargo deb` (cargo install cargo-deb) builds target/debian/lost_VERSION_ARCH.deb.
+[package.metadata.deb]
+maintainer = "LOST developers <https://github.com/Y2Z/LOST/issues>"
+copyright = "LOST developers"
+license-file = ["LICENSE", "0"]
+section = "web"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+LOST (Local Offline Search Tool) is a search engine for the web that runs \
+entirely on your own device. It searches datasets you import (Common Crawl, \
+Hacker News, .lost files), from a desktop app, the command line or a web UI, \
+with no internet connection needed."""
+conf-files = ["/etc/lost/lost.toml"]
+assets = [
+    ["target/release/lost", "usr/bin/", "755"],
+    ["dist/lost.desktop", "usr/share/applications/", "644"],
+    ["res/images/lost.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["dist/icons/lost-16.png", "usr/share/icons/hicolor/16x16/apps/lost.png", "644"],
+    ["dist/icons/lost-24.png", "usr/share/icons/hicolor/24x24/apps/lost.png", "644"],
+    ["dist/icons/lost-32.png", "usr/share/icons/hicolor/32x32/apps/lost.png", "644"],
+    ["dist/icons/lost-48.png", "usr/share/icons/hicolor/48x48/apps/lost.png", "644"],
+    ["dist/icons/lost-64.png", "usr/share/icons/hicolor/64x64/apps/lost.png", "644"],
+    ["dist/icons/lost-128.png", "usr/share/icons/hicolor/128x128/apps/lost.png", "644"],
+    ["dist/icons/lost-256.png", "usr/share/icons/hicolor/256x256/apps/lost.png", "644"],
+    ["dist/icons/lost-512.png", "usr/share/icons/hicolor/512x512/apps/lost.png", "644"],
+    ["dist/lost.toml", "etc/lost/lost.toml", "644"],
+    ["README.md", "usr/share/doc/lost/README.md", "644"],
+]
+# Installs dist/lost.service; it isn't enabled or started.
+systemd-units = { unit-scripts = "dist", enable = false, start = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

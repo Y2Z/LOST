@@ -1,0 +1,28 @@
+# LOST configuration.
+# System-wide: /etc/lost/lost.toml. Per user: ~/.lost/lost.toml (Linux/BSD),
+# ~/Library/Application Support/LOST/lost.toml (macOS), %USERPROFILE%\LOST\lost.toml (Windows).
+# Every key is optional; command-line flags override this file.
+
+[server]
+# Use "0.0.0.0" to serve the local network.
+# address = "127.0.0.1"
+# port = 1057
+# Largest result count the Web API returns in one request.
+# max_results = 1000
+
+[storage]
+# data_dir = "/var/lib/lost"
+
+[search]
+# default_limit = 50
+# A "Cached" link after each result's address (web UI and app):
+# cached_links = false
+
+[import]
+# .lost files from others, unless signed by someone you trust:
+# "ask" first, "signed-only" (never unsigned ones; ask about the rest)
+# or "any" (import everything without asking).
+# trust = "ask"
+
+[gui]
+# tray = true

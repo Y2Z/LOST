@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>LOST</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/lost.css">
+</head>
+<body class="home">
+<header>
+  <a class="logo" href="/" aria-label="LOST — start over">LOST</a>
+  <p class="tagline">Local Offline Search Tool</p>
+  <form id="search" role="search" action="/" method="get" autocomplete="off">
+    <div class="box">
+      <input id="q" name="q" type="search" placeholder="Search offline"
+             aria-label="Search" aria-autocomplete="list" aria-controls="suggestions"
+             aria-expanded="false" spellcheck="false">
+    </div>
+    <noscript><button class="find" type="submit">Find</button></noscript>
+  </form>
+  <ul id="suggestions" role="listbox" aria-label="Suggestions"></ul>
+</header>
+<main>
+  <p id="status" aria-live="polite"></p>
+  <article id="page" hidden>
+    <div class="about">
+      <h1></h1>
+      <p class="meta"><a class="url" rel="noopener noreferrer"></a><span></span></p>
+    </div>
+    <div class="text"></div>
+  </article>
+  <div id="results"></div>
+  <div id="loading" role="status" aria-label="Loading results" hidden><span></span><span></span><span></span></div>
+  <div id="more"></div>
+  <div id="rest"></div>
+</main>
+<button id="top" type="button" aria-label="Back to the top" title="Back to the top" tabindex="-1">
+  <svg class="ring" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="47.5" stroke-dasharray="298.45" stroke-dashoffset="298.45"/></svg>
+  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+</button>
+<script src="/mikado.light.min.js"></script>
+<script src="/lost.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LOST
+GenericName=Offline Search
+Comment=Search the web offline, using a local database
+Exec=lost
+Icon=lost
+Terminal=false
+Categories=Network;Utility;
+Keywords=search;offline;web;
+StartupNotify=false

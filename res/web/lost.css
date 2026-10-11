@@ -1,0 +1,618 @@
+/* LOST web UI. Dark by default (as in the first prototype), light when the
+   system asks for it. Nothing is loaded from anywhere else: no web fonts. */
+
+:root {
+  --bg: #1c1c1c;
+  --fg: #ececec;
+  --muted: #9a9a9a;
+  --field: #2e2e2e;
+  --field-focus: #383838;
+  --border: #3a3a3a;
+  --link: #8ab4f8;
+  --visited: #c58af9;
+  --url: #7fc8a0;
+  --active: #333;
+  --dots: #5c5c5c;
+  --top-bg: #4a4a4a;
+  --top-fg: #e6e6e6;
+  --box: #141414;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --fg: #1f1f1f;
+    --muted: #666;
+    --field: #f1f1f1;
+    --field-focus: #e9e9e9;
+    --border: #dcdcdc;
+    --link: #1a0dab;
+    --visited: #681da8;
+    --url: #1e7a46;
+    --active: #ececec;
+  --dots: #555;
+  --top-bg: #8a8a8a;
+  --top-fg: #ffffff;
+    --box: #f1f1f1;
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 17px;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Verdana, sans-serif;
+  line-height: 1.45;
+}
+
+/* ── Header: centred on the start page, a bar once there's a query ── */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 2;
+}
+
+/* The logo and search box glide between the start page and the bar
+   (lost.js animates them); scaling the logo starts from its top-left. */
+
+.logo {
+  color: var(--fg);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  font-size: 1.35rem;
+  text-decoration: none;
+  transform-origin: 0 0;
+  position: relative;
+  z-index: 1;
+}
+
+/* Out of sight under the logo while there are results, so it can fade
+   in and out as the page changes shape. */
+.tagline {
+  position: absolute;
+  left: 1.25rem;
+  top: 0.9rem;
+  margin: 0;
+  color: var(--muted);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+form {
+  flex: 0 1 40rem;
+  min-width: 0;
+  max-width: 40rem;
+  margin: 0;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.box {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Without JavaScript: the button that sends the search. */
+.find {
+  flex: none;
+  padding: 0 1.2rem;
+  border: 1px solid transparent;
+  border-radius: 0.6rem;
+  background: var(--field);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+/* On the start page it's in <noscript>: laid out as if it weren't — only
+   without JavaScript. (With it, <noscript> holds its markup as plain text,
+   which display: contents would show.) */
+@media (scripting: none) {
+  #search noscript {
+    display: contents;
+  }
+}
+
+.find:hover,
+.find:focus-visible {
+  background: var(--field-focus);
+  border-color: var(--border);
+  outline: none;
+}
+
+input {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border: 1px solid transparent;
+  border-radius: 0.6rem;
+  background: var(--field);
+  color: inherit;
+  font: inherit;
+  outline: none;
+}
+
+input:focus {
+  background: var(--field-focus);
+  border-color: var(--border);
+}
+
+body.home header {
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.6rem;
+  min-height: 70vh;
+  border-bottom-color: transparent;
+  position: relative;
+}
+
+body.home .logo {
+  font-size: 3.2rem;
+}
+
+body.home .tagline {
+  position: static;
+  opacity: 1;
+  visibility: visible;
+  margin-bottom: 1rem;
+}
+
+body.home form {
+  flex: none;
+  width: 100%;
+  margin-bottom: 4rem;
+}
+
+body.home main {
+  display: none;
+}
+
+/* ── Suggestions ──
+   Pills beside the search box, or on a line of their own under it when
+   the window is narrower. Always exactly one line, even when empty, so
+   nothing moves: pills that don't fit wrap onto a hidden second line.
+   None on the start page. */
+
+#suggestions {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 0.45rem;
+  height: 2.2rem;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+body.home #suggestions {
+  display: none;
+}
+
+/* Out of the way while the box isn't in use (the line stays). */
+#suggestions.idle {
+  visibility: hidden;
+}
+
+#suggestions li {
+  flex: none;
+  max-width: 100%;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--field);
+  font-size: 0.88rem;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+#suggestions li.active,
+#suggestions li:hover {
+  background: var(--active);
+  border-color: var(--muted);
+}
+
+/* ── Results ── */
+
+main {
+  max-width: 44rem;
+  padding: 0.5rem 1.25rem 6rem;
+  /* Lined up with the search box (lost.js measures where it starts). */
+  margin-left: max(0px, calc(var(--indent, 6.7rem) - 1.25rem));
+}
+
+#status,
+.status {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0.4rem 0 1.2rem;
+}
+
+.result {
+  margin-bottom: 1.6rem;
+}
+
+.result .title {
+  display: block;
+  color: var(--link);
+  font-size: 1.1rem;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.result .title:visited {
+  color: var(--visited);
+}
+
+.result .title:hover {
+  text-decoration: underline;
+}
+
+.result .snippet {
+  margin: 0.2rem 0;
+  overflow-wrap: anywhere;
+}
+
+/* The URL, cut to fit, and "Cached" after it. */
+.result .where {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.result .url {
+  min-width: 0;
+  color: var(--url);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.result .cached {
+  flex: none;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+/* Shown only with search.cached_links (the server adds the class). */
+html:not(.cached-links) .result .cached {
+  display: none;
+}
+
+.result .cached:hover,
+#status a:hover,
+.status a:hover {
+  text-decoration: underline;
+}
+
+#status a,
+.status a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+/* ── A stored page (cache:) ──
+   The text as LOST keeps it, as a text-mode browser would show it. */
+
+#page h1,
+.stored h1 {
+  margin: 0 0 0.35rem;
+  font-size: 1.4rem;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+/* About the page (title, address, date), boxed: not part of its text. */
+#page .about,
+.stored .about {
+  margin: 0 0 1.5rem;
+  padding: 0.9rem 1.1rem;
+  background: var(--box);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+#page .meta,
+.stored .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.75rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+#page .meta .url,
+.stored .meta .url {
+  color: var(--url);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+#page .text,
+.stored .text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+
+/* ── Without JavaScript: "Looooost", an "o" for each page, as on Google ── */
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: center;
+  margin: 2.5rem 0 1rem;
+}
+
+.pager > a,
+.pager > span {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 1.6rem;
+  text-decoration: none;
+}
+
+.pager .letter {
+  color: var(--link);
+  font-size: 2.2rem;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.pager .end .letter {
+  color: var(--fg);
+  letter-spacing: 0.08em;
+}
+
+/* "L" and "st" hug the o's; their labels line up with them. */
+.pager > .end:first-child {
+  align-items: flex-end;
+}
+
+.pager > .end:last-child {
+  align-items: flex-start;
+}
+
+.pager .current .letter {
+  color: var(--url);
+}
+
+.pager .label {
+  min-height: 1.2em;
+  color: var(--link);
+  font-size: 0.8rem;
+}
+
+.pager .current .label {
+  color: var(--fg);
+  font-weight: 700;
+}
+
+.pager a:hover .label {
+  text-decoration: underline;
+}
+
+mark {
+  background: none;
+  color: inherit;
+  font-weight: 700;
+}
+
+#more {
+  height: 1px;
+}
+
+/* Room for the results not loaded yet (lost.js sizes it). Never used as a
+   scroll anchor, so the window doesn't jump as it shrinks. */
+#rest {
+  overflow-anchor: none;
+}
+
+/* While results load into that room, the dots stay in view. */
+#rest > #loading {
+  position: sticky;
+  top: 45vh;
+}
+
+/* ── Loading: three bouncing dots ──
+   Shown only if loading takes more than a moment, so quick answers don't
+   flash it. While a new search runs, the old results fade back. */
+
+#loading {
+  display: flex;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 1.6rem 0;
+  animation: loading-in 0.2s 0.15s backwards;
+}
+
+#loading[hidden] {
+  display: none;
+}
+
+#loading span {
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 50%;
+  background: var(--dots);
+  animation: bounce 1s infinite ease-in-out;
+}
+
+#loading span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+#loading span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+  }
+  30% {
+    transform: translateY(-0.65rem);
+  }
+}
+
+@keyframes loading-in {
+  from {
+    opacity: 0;
+  }
+}
+
+#results.stale {
+  opacity: 0.35;
+  transition: opacity 0.2s 0.15s;
+}
+
+/* ── Back to the top ── */
+
+#top {
+  position: fixed;
+  right: 1.5rem;
+  bottom: 1.5rem;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--top-bg);
+  color: var(--top-fg);
+  box-shadow: 0 0.3rem 1rem rgb(0 0 0 / 0.3);
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(0.75rem) scale(0.9);
+  transition:
+    opacity 0.2s,
+    transform 0.2s,
+    visibility 0s 0.2s;
+}
+
+/* How far down the results are: drawn clockwise from 12 o'clock. */
+#top .ring {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+  pointer-events: none;
+}
+
+#top .ring circle {
+  fill: none;
+  /* Halfway between the button and its arrow. */
+  stroke: color-mix(in srgb, var(--top-fg) 50%, var(--top-bg));
+  stroke-width: 5; /* of the button's 100: about 2.5 pixels */
+}
+
+#top.shown {
+  opacity: 0.85;
+  visibility: visible;
+  transform: none;
+  transition:
+    opacity 0.2s,
+    transform 0.2s;
+}
+
+#top:hover,
+#top:focus-visible {
+  opacity: 1;
+}
+
+@media (max-width: 48rem) {
+  #top {
+    right: 1rem;
+    bottom: 1rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #loading span {
+    animation-name: pulse;
+  }
+
+  @keyframes pulse {
+    50% {
+      opacity: 0.3;
+    }
+  }
+}
+
+/* Not enough room beside the box: suggestions get the line under it,
+   starting where the box does (lost.js measures where that is). */
+@media (max-width: 64rem) {
+  body:not(.home) header {
+    flex-wrap: wrap;
+    row-gap: 0.5rem;
+  }
+
+  body:not(.home) form {
+    flex: 1 1 0;
+    max-width: none;
+  }
+
+  #suggestions {
+    flex-basis: 100%;
+    margin-left: calc(var(--indent, 6.7rem) - 1.25rem);
+  }
+}
+
+@media (max-width: 48rem) {
+  main {
+    margin-left: 0;
+  }
+
+  #suggestions {
+    margin-left: calc(var(--indent, 5rem) - 0.9rem);
+  }
+
+  header {
+    gap: 0.8rem;
+    padding: 0.7rem 0.9rem;
+  }
+
+  .tagline {
+    left: 0.9rem;
+    top: 0.7rem;
+  }
+
+  body.home .logo {
+    font-size: 2.6rem;
+  }
+}
