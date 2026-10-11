@@ -149,7 +149,7 @@ mod imp {
 
     /// `$XDG_RUNTIME_DIR/lost` on Linux and BSD (else a per-user folder in
     /// the temp folder), `$TMPDIR/lost` on macOS (already per-user there).
-    fn runtime_dir() -> io::Result<PathBuf> {
+    pub(super) fn runtime_dir() -> io::Result<PathBuf> {
         let dir = if cfg!(target_os = "macos") {
             std::env::temp_dir().join("lost")
         } else {
@@ -269,16 +269,20 @@ mod tests {
 
         // Only this user may connect.
         use std::os::unix::fs::PermissionsExt;
+        // Ask LOST where its sockets live (macOS ignores XDG_RUNTIME_DIR).
+        let sockets = imp::runtime_dir().unwrap();
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&dir.join("lost")), 0o700);
-        assert_eq!(mode(&dir.join("lost").join("server-65001.sock")), 0o600);
+        assert_eq!(mode(&sockets), 0o700);
+        assert_eq!(mode(&sockets.join("server-65001.sock")), 0o600);
 
         // A socket file nobody listens on is replaced.
         let stale = Role::Server(65002);
-        let path = dir.join("lost").join("server-65002.sock");
+        let path = sockets.join("server-65002.sock");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
         assert!(matches!(claim(stale).unwrap(), Claim::Ours(_)));
+        let _ = std::fs::remove_file(sockets.join("server-65001.sock"));
+        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
