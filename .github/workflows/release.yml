@@ -1,0 +1,129 @@
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) and this
+# builds every package and attaches them to a GitHub release:
+#   git tag v0.2.0 && git push origin v0.2.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    # The oldest Ubuntu runner, so the program runs on older systems too
+    # (it needs a C library at least as new as the one it was built with).
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME, but Cargo.toml says $version"; exit 1; }
+      - name: System libraries and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+          curl -fsSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage"
+          chmod +x appimagetool
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Tarball
+        run: make tarball
+      - name: Debian package
+        run: cargo deb
+      - name: AppImage
+        env:
+          APPIMAGETOOL: ${{ github.workspace }}/appimagetool
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: sh dist/appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            target/lost-*-linux.tar.gz
+            target/debian/*.deb
+            target/LOST-*.AppImage
+
+  macos:
+    name: macOS (Intel + Apple silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+      - name: Build both and join them
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/lost \
+            target/x86_64-apple-darwin/release/lost \
+            target/aarch64-apple-darwin/release/lost
+      - name: LOST.app
+        run: BIN=target/universal/lost sh dist/macos-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: target/LOST-*-macos.zip
+
+  windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+        env:
+          # No Visual C++ runtime DLLs needed on the user's computer.
+          RUSTFLAGS: -C target-feature=+crt-static
+      - name: Zip
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $name = "lost-$version-x86_64-windows"
+          New-Item -ItemType Directory -Path "target/$name" | Out-Null
+          Copy-Item target/release/lost.exe, README.md, LICENSE, dist/lost.toml "target/$name/"
+          Compress-Archive -Path "target/$name" -DestinationPath "target/$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/lost-*-windows.zip
+
+  release:
+    name: GitHub release
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd packages
+          find . -type f -printf '%P\n' | sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: packages/**/*
