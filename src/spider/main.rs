@@ -1,4 +1,4 @@
-//! lost-spider: LOST's crawler (ARCHITECTURE.md §15). It wanders a network
+//! lost-spider: LOST's crawler (ARCHITECTURE.md §15). It crawls a network
 //! and saves what it finds as a signed `.lost` file, which LOST imports like
 //! any other. It's a program of its own, built only on request
 //! (`--features spider`), so that LOST itself never goes online: it uses
@@ -33,14 +33,14 @@ use crate::net::Proxy;
 use crate::onion::Onion;
 
 const USAGE: &str = "\
-lost-spider — LOST's crawler. It wanders a network and saves what it finds
+lost-spider — LOST's crawler. It crawls a network and saves what it finds
 as a .lost file, signed with your ID, for LOST to import.
 
 Usage:
-  lost-spider gemini [OPTIONS]    Wander Geminispace
-  lost-spider gopher [OPTIONS]    Wander Gopherspace
-  lost-spider onion [OPTIONS]     Wander .onion sites, through Tor
-  lost-spider i2p [OPTIONS]       Wander I2P sites, through an I2P router
+  lost-spider gemini [OPTIONS]    Crawl Geminispace
+  lost-spider gopher [OPTIONS]    Crawl Gopherspace
+  lost-spider onion [OPTIONS]     Crawl .onion sites, through Tor
+  lost-spider i2p [OPTIONS]       Crawl I2P sites, through an I2P router
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -52,7 +52,7 @@ Options:
       --link URL          Crawl this first, even if nothing links to it
                           (repeat for more)
       --links FILE        The same, one URL a line
-      --dont-wander       Fetch only the --link URLs, and follow none of their
+      --dont-crawl       Fetch only the --link URLs, and follow none of their
                           links: to add those pages to a file, and nothing else
       --search PHRASE     Type PHRASE into the search boxes found, and crawl
                           what they find (repeat for more). Only boxes that
@@ -92,7 +92,7 @@ struct Options {
     links: Vec<String>,
     searches: Vec<String>,
     blacklist: Option<PathBuf>,
-    dont_wander: bool,
+    dont_crawl: bool,
     delay: Duration,
     host_limit: Option<u64>,
     proxy: Option<Proxy>,
@@ -156,7 +156,7 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
         links: Vec::new(),
         searches: Vec::new(),
         blacklist: None,
-        dont_wander: false,
+        dont_crawl: false,
         delay: Duration::from_secs(1),
         host_limit: None,
         proxy: None,
@@ -187,7 +187,7 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
             "--search" => options.searches.push(value()?),
             "--searches" => options.searches.extend(lines(Path::new(&value()?))?),
             "--blacklist" => options.blacklist = Some(PathBuf::from(value()?)),
-            "--dont-wander" => options.dont_wander = true,
+            "--dont-crawl" => options.dont_crawl = true,
             "--delay" => {
                 let text = value()?;
                 let seconds: f64 = text
@@ -219,8 +219,8 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
             other => return Err(format!("unknown option {other} (see lost-spider --help)").into()),
         }
     }
-    if options.dont_wander && options.links.is_empty() {
-        return Err("--dont-wander needs --link or --links: the pages to fetch".into());
+    if options.dont_crawl && options.links.is_empty() {
+        return Err("--dont-crawl needs --link or --links: the pages to fetch".into());
     }
     if options.continue_ && options.output.is_none() {
         return Err("-c needs the file to carry on with: -c -o FILE.lost".into());
@@ -287,12 +287,12 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     let name = name_of(&path);
     let before = writer.pages();
     match &identity {
-        Some(identity) => eprintln!("Saving to {name}, signed by {}.", identity.id()),
+        Some(identity) => eprintln!("Saving to {name}, signed as {}.", identity.id()),
         None => eprintln!("Saving to {name}, unsigned."),
     }
     if before > 0 {
         eprintln!(
-            "It has {} pages already; carrying on from their links.",
+            "It already has {} pages; carrying on from their links.",
             thousands(before)
         );
     }
@@ -302,7 +302,7 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
         host_limit: options.host_limit,
         searches: options.searches,
         blacklist,
-        dont_wander: options.dont_wander,
+        dont_crawl: options.dont_crawl,
         workers: WORKERS,
     };
     let crawler = Crawler::new(protocol, settings, known, &options.links);
@@ -318,12 +318,13 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     })
     .map_err(|e| format!("can't watch for Ctrl-C: {e}"))?;
 
-    // With --dont-wander it only fetches what it's given; otherwise it wanders.
-    let verb = if options.dont_wander {
+    // With --dont-crawl it only fetches what it's given; otherwise it crawls.
+    let verb = if options.dont_crawl {
         "Scraping"
     } else {
-        "Wandering"
+        "Crawling"
     };
+    let started = Instant::now();
     let terminal = std::io::stderr().is_terminal();
     let every = if terminal {
         Duration::from_secs(1)
@@ -333,9 +334,10 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     let status = |pages: u64| {
         let stats = crawler.stats();
         format!(
-            "{} {}… {} pages saved · {} {} · {} links waiting",
+            "{} {} for {}… {} pages saved · {} {} · {} links waiting",
             verb,
             P::SPACE,
+            duration(started.elapsed()),
             thousands(pages),
             thousands(stats.hosts as u64),
             P::HOSTS,
@@ -349,7 +351,6 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
             eprintln!("{line}");
         }
     };
-    let started = Instant::now();
     let mut chunks = writer.chunk_count();
     let mut checkpointed = Instant::now();
     let mut reported = Instant::now();
@@ -394,8 +395,7 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     let (file, pages, size) = writer.finish()?;
     file.sync_all()?;
     let new = pages - before;
-    let took = started.elapsed().as_secs();
-    let took = format!("{}h {:02}m", took / 3600, took / 60 % 60);
+    let took = duration(started.elapsed());
     if finished {
         eprintln!(
             "Done in {took}: {} new pages, {} in all, in {name} ({}).",
@@ -418,6 +418,24 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     }
     eprintln!("To search them: lost -d \"{}\"", path.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// "6 hours, 15 minutes, 56 seconds": the units from the largest one there
+/// is, so "56 seconds", "3 minutes, 0 seconds", "2 days, 0 hours, …".
+fn duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let parts = [
+        (secs / 86_400, "day"),
+        (secs / 3600 % 24, "hour"),
+        (secs / 60 % 60, "minute"),
+        (secs % 60, "second"),
+    ];
+    let first = parts.iter().position(|(n, _)| *n > 0).unwrap_or(3);
+    parts[first..]
+        .iter()
+        .map(|(n, unit)| format!("{n} {unit}{}", if *n == 1 { "" } else { "s" }))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Your ID, made if there isn't one yet; `None` if LOST's folder can't be
@@ -540,6 +558,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn durations() {
+        let d = |s: u64| duration(Duration::from_secs(s));
+        assert_eq!(d(0), "0 seconds");
+        assert_eq!(d(1), "1 second");
+        assert_eq!(d(56), "56 seconds");
+        assert_eq!(d(180), "3 minutes, 0 seconds");
+        assert_eq!(
+            d(6 * 3600 + 15 * 60 + 56),
+            "6 hours, 15 minutes, 56 seconds"
+        );
+        assert_eq!(d(86_400 + 3601), "1 day, 1 hour, 0 minutes, 1 second");
+    }
+
+    #[test]
     fn numbered_names() {
         assert_eq!(
             with_number(Path::new("a/crawl.lost"), 2),
@@ -586,9 +618,9 @@ mod tests {
         assert!(parse_options::<Gemini>(&args(&["--proxy", "localhost:9050"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["-t", "0"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["-c"])).is_err());
-        assert!(parse_options::<Gemini>(&args(&["--dont-wander"])).is_err());
-        let o = parse_options::<Gemini>(&args(&["--dont-wander", "--link", "a.org"]));
-        assert!(o.unwrap().unwrap().dont_wander);
+        assert!(parse_options::<Gemini>(&args(&["--dont-crawl"])).is_err());
+        let o = parse_options::<Gemini>(&args(&["--dont-crawl", "--link", "a.org"]));
+        assert!(o.unwrap().unwrap().dont_crawl);
         assert!(parse_options::<Gemini>(&args(&["--link", "https://x.org/"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--delay", "-1"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--bogus"])).is_err());

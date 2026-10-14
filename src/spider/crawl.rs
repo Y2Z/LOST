@@ -42,14 +42,14 @@ const FILE_EXTENSIONS: &[&str] = &[
     "psd", "xcf", "sqlite", "db", "bin",
 ];
 
-/// One network the spider can wander.
+/// One network the spider can crawl.
 pub trait Protocol: Send + Sync + 'static {
     /// The network's name, as `lost-spider NAME` takes it; also the pages'
     /// source, and part of the file's default name: `gemini`.
     const NAME: &'static str;
     /// The scheme a bare `--link example.org` gets: `gemini`.
     const SCHEME: &'static str;
-    /// The network's name, for "Wandering …": `Geminispace`.
+    /// The network's name, for "Crawling …": `Geminispace`.
     const SPACE: &'static str;
     /// What its hosts are called: `capsules`.
     const HOSTS: &'static str;
@@ -202,9 +202,9 @@ pub struct Settings {
     /// Phrases to type into search boxes.
     pub searches: Vec<String>,
     pub blacklist: Blacklist,
-    /// `--dont-wander`: only the `--link` URLs are fetched (and where they
+    /// `--dont-crawl`: only the `--link` URLs are fetched (and where they
     /// redirect); no link on them is followed.
-    pub dont_wander: bool,
+    pub dont_crawl: bool,
     /// Requests running at once (to different servers).
     pub workers: usize,
 }
@@ -1084,7 +1084,7 @@ impl State {
                     if let Some(host) = self.hosts.get_mut(key) {
                         host.saved += 1;
                     }
-                    if !settings.dont_wander {
+                    if !settings.dont_crawl {
                         for link in links {
                             if let Some(url) = Url::parse(&link.url) {
                                 self.enqueue(url, link.label, Kind::Page, 0, settings);
@@ -1094,7 +1094,7 @@ impl State {
                     page_out = Some(page);
                 }
             }
-            Outcome::Follow(links) if !settings.dont_wander => {
+            Outcome::Follow(links) if !settings.dont_crawl => {
                 for link in links {
                     if let Some(url) = Url::parse(&link.url) {
                         self.enqueue(url, link.label, Kind::Page, 0, settings);
@@ -1107,9 +1107,9 @@ impl State {
                 }
             }
             Outcome::Search(urls) => {
-                // Not wandering, a search's results are what was asked for:
+                // With --dont-crawl, a search's results are what was asked for:
                 // saved, not followed.
-                let kind = if settings.dont_wander {
+                let kind = if settings.dont_crawl {
                     Kind::Page
                 } else {
                     Kind::Results
@@ -1194,14 +1194,14 @@ impl<P: Protocol> Crawler<P> {
             active: 0,
             resolving: 0,
         };
-        // With --dont-wander, the links are all there is to fetch: no seeds,
+        // With --dont-crawl, the links are all there is to fetch: no seeds,
         // and nothing from the file's pages.
-        let seeds: &[&str] = if settings.dont_wander {
+        let seeds: &[&str] = if settings.dont_crawl {
             &[]
         } else {
             protocol.seeds()
         };
-        let known_links: &[String] = if settings.dont_wander {
+        let known_links: &[String] = if settings.dont_crawl {
             &[]
         } else {
             &known.links
@@ -1643,7 +1643,7 @@ mod tests {
             host_limit: None,
             searches: Vec::new(),
             blacklist: Blacklist::default(),
-            dont_wander: false,
+            dont_crawl: false,
             workers: 4,
         }
     }
@@ -1799,7 +1799,7 @@ mod tests {
     }
 
     #[test]
-    fn not_wandering() {
+    fn not_crawling() {
         let pages = vec![
             (
                 "gemini://a.test/",
@@ -1811,7 +1811,7 @@ mod tests {
             ("gemini://c.test/", doc("C")),
         ];
         let only = Settings {
-            dont_wander: true,
+            dont_crawl: true,
             searches: vec!["cats".into()],
             ..settings()
         };

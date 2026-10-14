@@ -103,16 +103,16 @@ LOST is capable of importing and exporting `.lost` dataset files, which makes it
 LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/), Gopherspace, `.onion` sites and I2P sites there's `lost-spider`, a separate crawler that isn't built or installed by default:
 
 ```console
-cargo install lost --features spider                # or: make spider
-lost-spider gemini                                  # wander all of Geminispace
-lost-spider gemini --link example.org -o my.lost    # start at a capsule nothing links to
-lost-spider gemini --link example.org --dont-wander # only that page, nothing else
-lost-spider gemini -c -o my.lost                    # carry on where it stopped
-lost-spider gopher                                  # wander all of Gopherspace
-lost-spider onion                                   # .onion sites, through Tor (127.0.0.1:9050)
-lost-spider i2p                                     # I2P sites, through an I2P router (127.0.0.1:4444)
-lost-spider gemini --proxy socks5://127.0.0.1:9050  # Gemini through Tor
-lost -d my.lost                                     # import what it found
+cargo install lost --features spider               # or: make spider
+lost-spider gemini                                 # crawl all of Geminispace
+lost-spider gemini --link example.org -o my.lost   # start at a capsule nothing links to
+lost-spider gemini --link example.org --dont-crawl # only that page, nothing else
+lost-spider gemini -c -o my.lost                   # carry on where it stopped
+lost-spider gopher                                 # crawl all of Gopherspace
+lost-spider onion                                  # .onion sites, through Tor (127.0.0.1:9050)
+lost-spider i2p                                    # I2P sites, through an I2P router (127.0.0.1:4444)
+lost-spider gemini --proxy socks5://127.0.0.1:9050 # Gemini through Tor
+lost -d my.lost                                    # import what it found
 ```
 
 It obeys robots.txt, asks each server for one thing a second (`--delay`), and saves everything into one `.lost` file signed with your ID.  The file is complete even if you stop it with Ctrl-C.  See `lost-spider --help` for search boxes, blacklists, proxies and limits.

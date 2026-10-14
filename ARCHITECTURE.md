@@ -840,7 +840,7 @@ A crawler for the networks LOST can't get dumps of. It saves what it finds as a 
 ### 15.1 Command line
 
 ```
-lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander]
+lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
                     [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS]
                     [--host-limit N] [--proxy URL] [-t SECONDS]
 ```
@@ -852,7 +852,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander
 | `-o`, `--output PATH` | A `.lost` file, or a folder to put one in. Default name: `lost-crawl-data-NETWORK-YYYYMMDD-HHMMSS.lost` (UTC), in the current folder. An existing file isn't touched: ` (1)`, ` (2)`… goes before `.lost` |
 | `-c`, `--continue` | Carry on with exactly the `-o` file (§9.4, §15.3), whoever signed it; started under that name if it doesn't exist |
 | `--link URL`, `--links FILE` | Crawled first, even if nothing links to them (`example.org` means `gemini://example.org/`, or `gopher://…` for Gopher). A file has one a line; blank lines and `#` comments are skipped |
-| `--dont-wander` | Fetch only the `--link` URLs (following their redirects) and none of the links on them: an easy way to add certain pages to a file, and nothing else. No seeds, and with `-c` nothing from the file's pages; a search box among them gets the `--search` phrases, and the results pages are saved. Needs `--link` or `--links` |
+| `--dont-crawl` | Fetch only the `--link` URLs (following their redirects) and none of the links on them: an easy way to add certain pages to a file, and nothing else. No seeds, and with `-c` nothing from the file's pages; a search box among them gets the `--search` phrases, and the results pages are saved. Needs `--link` or `--links` |
 | `--search PHRASE`, `--searches FILE` | Typed into the search boxes found (§15.2) |
 | `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`). Skipped pages aren't saved and their links aren't followed |
 | `--delay SECONDS` | Between two requests to the same server; default 1, decimals allowed |
@@ -861,17 +861,17 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander
 | `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
-- Signed with your ID (§9.2), made if there's none yet; unsigned only if LOST's folder can't be found.
-- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Wandering Geminispace… 1,234 pages saved · 56 capsules · 7,890 links waiting` — `Scraping Geminispace…` with `--dont-wander`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise.
+- Signed with your ID (§9.2), made if there's none yet ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."); unsigned only if LOST's folder can't be found.
+- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Crawling Geminispace for 2 hours, 5 minutes, 9 seconds… 1,234 pages saved · 56 capsules · 7,890 links waiting` (the time is this run's) — `Scraping Geminispace…` with `--dont-crawl`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise.
 - Ctrl-C (or SIGTERM, SIGHUP) stops: requests under way are abandoned, pages already received are written, and the file is finished and signed. A second Ctrl-C quits at once, leaving the file as of its last checkpoint. The last lines say how to continue and how to import.
 
 ### 15.2 Crawling (`crawl.rs`)
 
-- **Start:** the `--link` URLs first, then the network's seeds, then (with `-c`) the links of the file's pages. With `--dont-wander`, only the `--link` URLs (§15.1).
+- **Start:** the `--link` URLs first, then the network's seeds, then (with `-c`) the links of the file's pages. With `--dont-crawl`, only the `--link` URLs (§15.1).
 - **Looking up hosts:** at most half the workers look up host names while there are servers ready to be asked, so a run that starts with thousands of new hosts (as a continued one does) gets to crawling at once.
 - **Politeness:** one request at a time per server *IP address* — a host serving thousands of capsules as subdomains is one server — `--delay` apart; up to 32 requests at once to different servers. Through a proxy nothing is looked up, and every host is a server of its own. A "slow down" answer (Gemini's 44) is waited out before asking again.
 - **robots.txt** is fetched from every host before anything else, every run. The rules of the groups for `*`, `indexer`, `archiver` (Gemini's "virtual user agents") and `lost-spider` apply; the longest matching rule wins (`Allow` on a tie); `*` and a final `$` work as in Google's rules. No robots.txt means everything is allowed.
-- **Internationalized host names** (`café.example`) are kept as written, lowercased, in the saved pages, and sent in punycode (`xn--caf-dma.example`: looked up, in TLS's SNI, in the request); both spellings are the same host for politeness, robots.txt, `--dont-wander`, `--host-limit` and `--blacklist`. The conversion is `urls::ascii_host`: RFC 3492, without IDNA's Unicode mapping tables.
+- **Internationalized host names** (`café.example`) are kept as written, lowercased, in the saved pages, and sent in punycode (`xn--caf-dma.example`: looked up, in TLS's SNI, in the request); both spellings are the same host for politeness, robots.txt, `--dont-crawl`, `--host-limit` and `--blacklist`. The conversion is `urls::ascii_host`: RFC 3492, without IDNA's Unicode mapping tables.
 - **Once each:** URLs that normalize alike (§6.5) are fetched once a run. A page with the same text as one saved already isn't saved, nor its links followed.
 - **Skipped URLs:** longer than 1024 bytes, more than 30 path segments or one segment 3 times or more (pages that generate themselves), host names that can't be one, other schemes, `--blacklist` matches, hosts at `--host-limit`.
 - **Failures:** redirects are followed up to 5 in a row. A failed request (no connection, a TLS failure, a timeout) is tried once more; a host that fails 3 in a row is left alone for the rest of the run, as is one whose name doesn't resolve. "Try later" answers are tried twice more.
@@ -909,7 +909,7 @@ Both are ordinary websites reached through a proxy, so they share an HTTP client
 - **HTTP/1.1** (`http.rs`): `GET`, `Connection: close`, `Accept-Encoding: gzip`; chunked bodies put back together; `User-Agent: lost-spider/VERSION`. Through a SOCKS5 proxy the request goes down a tunnel; through an HTTP proxy it names the whole URL (`GET http://site.i2p/page HTTP/1.1`). `https://` works over SOCKS5, accepting any certificate (a `.onion` address already proves which server it is), not through an HTTP proxy.
 - **Answers:** 2xx is a document — text (`text/*`, XHTML; `text/html` when the server doesn't say) read up to 5 MB, anything else saved by its link alone without reading it; 301/302/303/307/308 a redirect; 429 and 503 with `Retry-After` a slow-down; other 5xx "try later"; anything else "not found".
 - **HTML:** the title from `<title>`, the text from `text::html_to_text` (which leaves out scripts, styles, comments and SVG, and turns blocks into blank lines), the links from `<a href>`, `<area href>`, `<frame src>` and `<iframe src>`, resolved against the page, each with its text, plus `http(s)://` URLs written in the text (lists of sites often are just that). Latin-1 or Windows-1252 when the type or a `<meta>` near the start says so and the bytes aren't UTF-8. Other text: as it is, with `http(s)://` URLs written in it as links.
-- robots.txt, the blacklist, search boxes, `-c`, `--dont-wander` and the rest work as for the other networks.
+- robots.txt, the blacklist, search boxes, `-c`, `--dont-crawl` and the rest work as for the other networks.
 
 **`.onion`** (`lost-spider onion`):
 
