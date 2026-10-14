@@ -70,8 +70,9 @@ LOST searches through whatever datasets you import.  It comes out of the box wit
 - Common Crawl (WET and WAT files)
 - Hacker News (BigQuery CSV export)
 - `.lost` files — LOST's own format
+- Gemini — crawled with `lost-spider` (see [below](#gemini))
 
-<!-- More soon to come: Gemini, Gopher, .onion, I2P. -->
+<!-- More soon to come: Gopher, .onion, I2P. -->
 
 
 ### Datasets
@@ -98,6 +99,21 @@ SELECT * FROM `bigquery-public-data.hacker_news.full` WHERE timestamp >= '2026-0
 #### LOST files
 
 LOST is capable of importing and exporting `.lost` dataset files, which makes it possible to freely and safely exchange crawl data with other LOST users.  They can be optionally signed, to ensure that your database doesn't get corrupted or spammed.  Both exports and imports can be made either via CLI (see [Usage](#working-with-datasets)) or GUI (Settings → Data).
+
+#### Gemini
+
+LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/) there's `lost-spider`, a separate crawler that isn't built or installed by default:
+
+```console
+cargo install lost --features spider                # or: make spider
+lost-spider gemini                                  # wander all of Geminispace
+lost-spider gemini --link example.org -o my.lost    # start at a capsule nothing links to
+lost-spider gemini --link example.org --dont-wander # only that capsule
+lost-spider gemini -c -o my.lost                    # carry on where it stopped
+lost -d my.lost                                     # import what it found
+```
+
+It obeys robots.txt, asks each server for one thing a second (`--delay`), and saves everything into one `.lost` file signed with your ID.  The file is complete even if you stop it with Ctrl-C.  See `lost-spider --help` for search boxes, blacklists and limits.
 
 
 ### Database
@@ -131,6 +147,11 @@ cargo build --release --no-default-features --features cli,gui
 #### Bare library
 ```console
 cargo build --release --no-default-features --lib
+```
+
+#### Spider (crawler)
+```console
+cargo build --release --no-default-features --features spider --bin lost-spider
 ```
 
 #### Packages

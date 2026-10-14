@@ -181,6 +181,7 @@ Cargo features decide what goes into the binary.
 | `cli` | The `lost` binary, argument parsing, CLI output, local-socket IPC | yes |
 | `server` | Web server, Web API, embedded web UI, `-b` daemon mode | yes |
 | `gui` | egui desktop GUI, tray icon | yes |
+| `spider` | `lost-spider`, the crawler (§15): a separate program, the only part of LOST that goes online | **no** |
 
 Examples:
 
@@ -190,6 +191,7 @@ cargo build --release --no-default-features --features cli       # CLI only
 cargo build --release --no-default-features --features cli,server
 cargo build --release --no-default-features --features cli,gui
 cargo build --release --no-default-features --lib                # library only
+cargo build --release --no-default-features --features spider --bin lost-spider   # the crawler only
 ```
 
 Planned dependencies (to be added as each part is implemented):
@@ -205,6 +207,7 @@ Planned dependencies (to be added as each part is implemented):
 | IPC | standard library Unix sockets; `interprocess` for named pipes on Windows |
 | Server | `axum`, `tokio`; `libc` for `-b` on Unix |
 | GUI | `eframe` (egui), `rfd` (file picker); tray: `ksni` on Linux/BSD (D-Bus StatusNotifierItem, no GTK), `tray-icon` on Windows/macOS |
+| Spider | `rustls` (with `ring`: no CMake needed) for Gemini's TLS, `ctrlc`, `regex` (`--blacklist`) |
 
 ### 5.1 Platforms
 
@@ -505,7 +508,7 @@ The common shape every parser produces:
 ### 8.6 Later
 
 - **Common Crawl WARC files** — the pages as fetched (`…-00000.warc.gz`, several times the size of the WET and WAT made from them). Text, title and links come from the HTML itself, so the WET and WAT aren't needed; the raw responses go to the capture archive (§6.7). A WARC file and its WET and WAT are one import (§8.2).
-- **Gemini** — dumps from TLGS-style crawlers; possibly a built-in crawler (build-time feature) to keep Gemini data current.
+- **Gemini** — crawled with `lost-spider gemini` (§15), which saves `.lost` files; dumps from other crawlers later.
 - **Gopher**, **.onion** dumps.
 - **I2P** — the XL-I2P CSV dataset from IEEE DataPort, once obtained.
 - More web dumps as they turn up.
@@ -544,7 +547,7 @@ A portable file for sharing crawl data between LOST users — over BitTorrent, S
 - The footer comes last, so the file is written in one pass. A file that doesn't end in a footer and `TSOL` is reported as incomplete ("was the download cut short?").
 - Opening a file checks the layout: chunks fill the space between header and footer, in order, and their page counts add up.
 - Limits for files from elsewhere: header 1 MB, footer 64 MB, chunk 256 MB packed and 1 GB unpacked.
-- Exports are written to `NAME.part` next to the target and renamed when complete; a failed or cancelled export leaves nothing behind.
+- Exports are written to `NAME.part` next to the target and renamed when complete; a failed or cancelled export leaves nothing behind. `lost-spider` writes straight into its file instead, keeping it complete as it grows (§9.4).
 
 ### 9.2 Signing, trust and anonymity
 
@@ -583,6 +586,15 @@ A portable file for sharing crawl data between LOST users — over BitTorrent, S
 - Pages are written in index order (not ranked), as stored: URL, sources, title, text, links, crawl date. Import ids aren't exported.
 - Exporting takes the busy lock (§6.3), so it never runs alongside an import.
 - A fresh install has two sample pages to search (§8.7).
+
+### 9.4 Writing as it goes, and continuing
+
+For `lost-spider` (§15), whose files grow for hours and must survive being stopped (`Writer::checkpoint`, `Writer::append`):
+
+- **Checkpoints.** After every chunk, and at least every 5 minutes (closing a smaller chunk), the footer and signature are written after the chunks so far, so the file is complete as it stands: it can be imported, or continued. The next chunk is written over that footer. Only a crash between writing a chunk and its new footer — a moment — leaves the file incomplete.
+- **Continuing.** The footer is read and the file cut where it starts; new chunks go after the old ones, and the new footer lists them all. The header keeps its `created`, `generator` and `query`; its `signer` and the signed flag become whoever continues it (or unsigned), and the new signature covers every chunk, old ones included. Continuing someone's file makes it yours, as importing and re-exporting their pages would. If the header changes size (an unsigned file signed now, or the other way round), the file is written again as `NAME.part` and moved over the old one; otherwise nothing moves. A damaged chunk is left as it is.
+- A file being written is locked (an OS file lock, gone when the program ends), so two programs can't write it at once.
+- Nothing about a crawl is stored in the file besides its pages: the next run works out the rest from them (§15.3).
 
 ---
 
@@ -765,7 +777,11 @@ lost/
     │   └── hacker_news.rs
     ├── server.rs             web server and Web API         [server]
     ├── daemon.rs             -b background mode (Unix)      [server]
-    └── gui.rs                egui GUI and tray              [gui]
+    ├── gui.rs                egui GUI and tray              [gui]
+    └── spider/               lost-spider, its own program   [spider]
+        ├── main.rs           command line, the output file, Ctrl-C
+        ├── crawl.rs          queue, politeness, robots.txt, blacklist
+        └── gemini.rs         Gemini: TLS, responses, gemtext
 ```
 
 ### 13.1 Library API (sketch)
@@ -799,7 +815,7 @@ lost.remove_import(import_id)?;
 
 ### Later
 
-- Gemini, Gopher, .onion and I2P data sources; a Gemini crawler.
+- ✅ `lost-spider gemini` (§15). Next: `gopher`, `onion` (through Tor's SOCKS proxy), `i2p` (through I2P's HTTP proxy).
 - `related:`; link-based ranking.
 - Multiple physical indexes for very large deployments; LAN federation.
 - Mobile apps via UniFFI bindings; Docker image; FreeBSD rc script; Windows service.
@@ -807,6 +823,64 @@ lost.remove_import(import_id)?;
 
 ---
 
-## 15. Open questions
+## 15. lost-spider
+
+A crawler for the networks LOST can't get dumps of. It saves what it finds as a signed `.lost` file, which LOST imports like any other. LOST never goes online (§1); the spider is the one part that does, so it's kept apart:
+
+- **Built only on request:** the `spider` feature isn't in the default set (`cargo build --release --no-default-features --features spider --bin lost-spider`, `cargo install lost --features spider`, or `make spider`). The packages don't include it, so installing LOST never means something crawls in the background.
+- **Its own code:** `src/spider/` holds the binary's own modules (`main.rs`, `crawl.rs` for what every network shares, one file per network). It uses the library — `lostfile` for writing and signing, `urls`, `Identity` — and nothing in the library or the `lost` binary knows it exists. Its dependencies are optional and only it uses them.
+- No GUI.
+
+### 15.1 Command line
+
+```
+lost-spider gemini [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander]
+                   [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS] [--host-limit N]
+```
+
+| Option | What it does |
+|---|---|
+| `-o`, `--output PATH` | A `.lost` file, or a folder to put one in. Default name: `lost-crawl-data-gemini-YYYYMMDD-HHMMSS.lost` (UTC), in the current folder. An existing file isn't touched: ` (1)`, ` (2)`… goes before `.lost` |
+| `-c`, `--continue` | Carry on with exactly the `-o` file (§9.4, §15.3), whoever signed it; started under that name if it doesn't exist |
+| `--link URL`, `--links FILE` | Crawled first, even if nothing links to them (`example.org` means `gemini://example.org/`). A file has one a line; blank lines and `#` comments are skipped |
+| `--dont-wander` | Crawl only the hosts of the `--link` URLs (exactly those hosts and ports, not their subdomains): their links are followed within those hosts, and nowhere else. No seeds. Needs `--link` or `--links` |
+| `--search PHRASE`, `--searches FILE` | Typed into the search boxes found (§15.2) |
+| `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`). Skipped pages aren't saved and their links aren't followed |
+| `--delay SECONDS` | Between two requests to the same server; default 1, decimals allowed |
+| `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
+
+- Nothing given on the command line is stored, so `-c` needs the options again.
+- Signed with your ID (§9.2), made if there's none yet; unsigned only if LOST's folder can't be found.
+- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Wandering Geminispace… 1,234 pages saved · 56 capsules · 7,890 links waiting` — `Crawling Geminispace…` with `--dont-wander`, since it only goes where it's sent — redrawn every second on a terminal, a line a minute otherwise.
+- Ctrl-C (or SIGTERM, SIGHUP) stops: requests under way are abandoned, pages already received are written, and the file is finished and signed. A second Ctrl-C quits at once, leaving the file as of its last checkpoint. The last lines say how to continue and how to import.
+
+### 15.2 Crawling (`crawl.rs`)
+
+- **Start:** the `--link` URLs first, then the network's seeds, then (with `-c`) the links of the file's pages. With `--dont-wander`, no seeds, and only links within the `--link` hosts are followed (with `-c` too).
+- **Looking up hosts:** at most half the workers look up host names while there are servers ready to be asked, so a run that starts with thousands of new hosts (as a continued one does) gets to crawling at once.
+- **Politeness:** one request at a time per server *IP address* — a host serving thousands of capsules as subdomains is one server — `--delay` apart; up to 32 requests at once to different servers. A "slow down" answer (Gemini's 44) is waited out before asking again.
+- **robots.txt** is fetched from every host before anything else, every run. The rules of the groups for `*`, `indexer`, `archiver` (Gemini's "virtual user agents") and `lost-spider` apply; the longest matching rule wins (`Allow` on a tie); `*` and a final `$` work as in Google's rules. No robots.txt means everything is allowed.
+- **Internationalized host names** (`café.example`) are kept as written, lowercased, in the saved pages, and sent in punycode (`xn--caf-dma.example`: looked up, in TLS's SNI, in the request); both spellings are the same host for politeness, robots.txt, `--dont-wander`, `--host-limit` and `--blacklist`. The conversion is `urls::ascii_host`: RFC 3492, without IDNA's Unicode mapping tables.
+- **Once each:** URLs that normalize alike (§6.5) are fetched once a run. A page with the same text as one saved already isn't saved, nor its links followed.
+- **Skipped URLs:** longer than 1024 bytes, more than 30 path segments or one segment 3 times or more (pages that generate themselves), host names that can't be one, other schemes, `--blacklist` matches, hosts at `--host-limit`.
+- **Failures:** redirects are followed up to 5 in a row. A failed request (no connection, a TLS failure, a timeout) is tried once more; a host that fails 3 in a row is left alone for the rest of the run, as is one whose name doesn't resolve. "Try later" answers are tried twice more.
+- **Search boxes:** only with `--search`. A box gets each phrase if its prompt or path says search, query, find, keyword… and nothing like comment, post, message, reply, name, mail, password… — a guestbook looks just like a search box, and the spider never writes anything anywhere. Password boxes (Gemini's 11) never. The results pages' links are followed; the pages aren't saved. robots.txt still applies: TLGS, for one, disallows its search page, so it isn't searched.
+- **Files** with a known extension (images, audio, video, archives, PDFs, fonts, …) are saved from the link alone: the URL, the link's text (or the file name) as title, no text, and the server isn't asked. Other responses that aren't text are saved the same way, after reading only the response's first line.
+- **Pages:** `url`, `sources` (`["gemini"]`), `title` (the page's own, else the link's text, else the file name, else the host), `body`, `links` (all of them, any scheme), `crawled`.
+
+### 15.3 Continuing
+
+With `-c`, the file's pages are read first: their URLs count as fetched, their texts' hashes as seen, pages per host are counted for `--host-limit`, and every link that isn't a page yet is queued — newest first, since the last pages' links are where the crawl stopped, while older links still not crawled are mostly ones that failed before. URLs fetched before but never saved (redirects, errors, unreachable hosts, duplicates, search results) are asked again — after weeks or months, that's what's wanted. robots.txt, slow-downs and failure counts start fresh. A damaged chunk is skipped while reading (its pages may be crawled again).
+
+### 15.4 Gemini (`gemini.rs`)
+
+- TLS 1.2 or 1.3 (rustls with ring), with SNI. Any certificate is accepted: Gemini capsules sign their own, and only public pages are read; the handshake's signatures are still checked.
+- A request is the URL and CRLF; a response, `NN META` and CRLF. 10 s to connect, 15 s for each read or write, 60 s for a whole response; text over 5 MB is cut there. A connection closed without TLS's close_notify ends a response normally (many servers do that).
+- `text/gemini`: the title is the first `#` heading (else the first heading of any level); the body is every line's text without the markup — a `=>` line's text, or its URL if it has none; preformatted blocks as they are; links are the `=>` lines, resolved against the page, plus `gemini://` URLs written in the text. `text/markdown`: the title from the first `# ` line. Other `text/*`: the text as it is. UTF-8, or Latin-1 when the server says so.
+- Seeds: geminiprotocol.net, the known-hosts lists of Kennedy and TLGS, the BBS at bbs.geminispace.org, the Antenna aggregator and mozz.us.
+
+---
+
+## 16. Open questions
 
 None at the moment. (The icon, once one, is settled: `res/images/lost.svg`, "LOST" in Inter ExtraBold as outlines on a dark rounded square; `lost-64.rgba` for the window and tray, `dist/icons/` for packages.)

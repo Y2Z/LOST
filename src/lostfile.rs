@@ -231,6 +231,21 @@ impl<'a, W: Write> Writer<'a, W> {
         self.pages + self.buffered
     }
 
+    /// Chunks written so far (not counting the one being filled).
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Pages waiting in the chunk being filled.
+    pub fn buffered(&self) -> u64 {
+        self.buffered
+    }
+
+    /// Writes the chunk being filled now, even if it isn't full yet.
+    pub fn flush_chunk(&mut self) -> Result<()> {
+        self.close_chunk()
+    }
+
     fn close_chunk(&mut self) -> Result<()> {
         if self.buffered == 0 {
             return Ok(());
@@ -254,6 +269,16 @@ impl<'a, W: Write> Writer<'a, W> {
     /// output, the number of pages and the file's size in bytes.
     pub fn finish(mut self) -> Result<(W, u64, u64)> {
         self.close_chunk()?;
+        let footer = self.footer()?;
+        self.out.write_all(&footer)?;
+        self.out.flush()?;
+        let size = self.position + footer.len() as u64;
+        Ok((self.out, self.pages, size))
+    }
+
+    /// The footer for the chunks written so far, signed, with its length
+    /// and the end mark after it.
+    fn footer(&self) -> Result<Vec<u8>> {
         let signature = match self.identity {
             Some(identity) => {
                 let message = signed_message(&self.header, &self.chunks)
@@ -262,17 +287,133 @@ impl<'a, W: Write> Writer<'a, W> {
             }
             None => None,
         };
-        let footer = serde_json::to_vec(&Footer {
+        let mut footer = serde_json::to_vec(&Footer {
             pages: self.pages,
-            chunks: std::mem::take(&mut self.chunks),
+            chunks: self.chunks.clone(),
             signature,
         })?;
+        let len = footer.len() as u32;
+        footer.extend_from_slice(&len.to_le_bytes());
+        footer.extend_from_slice(END);
+        Ok(footer)
+    }
+}
+
+/// Writing straight into a file that stays complete as it grows
+/// (ARCHITECTURE.md §9.4).
+impl<'a> Writer<'a, File> {
+    /// Writes the footer (and signature) after the chunks written so far,
+    /// so the file is complete as it stands: it can be imported, or
+    /// continued with [`Writer::append`]. The next chunk overwrites it.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let footer = self.footer()?;
+        self.out.seek(SeekFrom::Start(self.position))?;
         self.out.write_all(&footer)?;
-        self.out.write_all(&(footer.len() as u32).to_le_bytes())?;
-        self.out.write_all(END)?;
-        self.out.flush()?;
-        let size = self.position + footer.len() as u64 + 8;
-        Ok((self.out, self.pages, size))
+        self.out.set_len(self.position + footer.len() as u64)?;
+        self.out.sync_data()?;
+        self.out.seek(SeekFrom::Start(self.position))?;
+        Ok(())
+    }
+
+    /// Opens a complete `.lost` file to add pages to it: they go after its
+    /// chunks, and from now on it's signed with `identity` (or unsigned
+    /// without one), whoever signed it before. The file is complete again
+    /// before this returns, and locked while the writer is open.
+    pub fn append(path: &Path, identity: Option<&'a Identity>) -> Result<Writer<'a, File>> {
+        let mut reader = Reader::open(path)?;
+        let name = reader.name.clone();
+        let mut header = reader.header.clone();
+        header.signer = identity.map(|i| to_hex(&i.public_key()));
+        let header_bytes = serde_json::to_vec(&header)?;
+        let flags = if identity.is_some() { FLAG_SIGNED } else { 0 };
+        let mut chunks = reader.footer.chunks.clone();
+        let pages = reader.footer.pages;
+        let mut data_end = chunks
+            .last()
+            .map_or(reader.data_start, |c| c.offset + c.size);
+
+        if 10 + header_bytes.len() as u64 != reader.data_start {
+            // The header changes size (an unsigned file signed now, or the
+            // other way round): the chunks move, so the file is written
+            // again next to the old one, then put in its place.
+            let partial = PathBuf::from(format!("{}.part", path.display()));
+            let mut rewrite = || -> Result<u64> {
+                let mut out = File::create(&partial)
+                    .map_err(|e| format!("can't write {}: {e}", partial.display()))?;
+                out.write_all(MAGIC)?;
+                out.write_all(&[FORMAT_VERSION, flags])?;
+                out.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
+                out.write_all(&header_bytes)?;
+                let mut position = 10 + header_bytes.len() as u64;
+                for (i, chunk) in chunks.iter_mut().enumerate() {
+                    let packed = reader.read_packed(i)?;
+                    out.write_all(&packed)?;
+                    chunk.offset = position;
+                    position += chunk.size;
+                }
+                let writer = Writer {
+                    out,
+                    identity,
+                    header: header_bytes.clone(),
+                    position,
+                    buffer: Vec::new(),
+                    buffered: 0,
+                    chunks: chunks.clone(),
+                    pages,
+                };
+                let (out, _, _) = writer.finish()?;
+                out.sync_all()?;
+                Ok(position)
+            };
+            match rewrite() {
+                Ok(end) => data_end = end,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&partial);
+                    return Err(e);
+                }
+            }
+            drop(reader);
+            std::fs::rename(&partial, path)
+                .map_err(|e| format!("can't replace {}: {e}", path.display()))?;
+        } else {
+            drop(reader);
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("can't write {}: {e}", path.display()))?;
+        lock(&file, &name)?;
+        file.seek(SeekFrom::Start(5))?;
+        file.write_all(&[flags])?;
+        file.seek(SeekFrom::Start(10))?;
+        file.write_all(&header_bytes)?;
+        let mut writer = Writer {
+            out: file,
+            identity,
+            header: header_bytes,
+            position: data_end,
+            buffer: Vec::with_capacity(CHUNK_BYTES + (1 << 20)),
+            buffered: 0,
+            chunks,
+            pages,
+        };
+        writer.checkpoint()?;
+        Ok(writer)
+    }
+}
+
+/// Locks a `.lost` file being written, so a second program can't write it
+/// at the same time. The lock goes when the file is closed (or the program
+/// dies). File systems without locks are written without one.
+pub fn lock(file: &File, name: &str) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(format!("{name} is being written by another program").into())
+        }
+        Err(std::fs::TryLockError::Error(_)) => Ok(()),
     }
 }
 
@@ -282,6 +423,8 @@ impl<'a, W: Write> Writer<'a, W> {
 pub struct Reader {
     file: File,
     name: String,
+    /// Where the first chunk starts, right after the header.
+    data_start: u64,
     header: Header,
     footer: Footer,
     signer: Option<[u8; 32]>,
@@ -403,6 +546,7 @@ impl Reader {
         Ok(Reader {
             file,
             name,
+            data_start,
             header,
             footer,
             signer,
@@ -837,6 +981,82 @@ mod file_tests {
         std::fs::write(&tampered, b"url,title\n").unwrap();
         let error = Reader::open(&tampered).err().unwrap().to_string();
         assert!(error.contains("isn't a .lost file"), "{error}");
+    }
+
+    #[test]
+    fn checkpoints_and_appending() {
+        let me = Identity {
+            key: ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+        };
+        let them = Identity {
+            key: ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]),
+        };
+        let pages_of = |path: &Path| {
+            let mut reader = Reader::open(path).unwrap();
+            let (pages, damaged) = read_all(&mut reader);
+            assert_eq!(damaged, 0);
+            (pages, reader.signer())
+        };
+
+        // A file that's complete after every checkpoint.
+        let path = temp("growing.lost");
+        let _ = std::fs::remove_file(&path);
+        let file = File::create_new(&path).unwrap();
+        let mut writer = Writer::new(file, None, Some(&me)).unwrap();
+        writer.checkpoint().unwrap();
+        assert_eq!(Reader::open(&path).unwrap().pages(), 0);
+        for i in 0..10 {
+            writer.add(&page(i)).unwrap();
+        }
+        writer.flush_chunk().unwrap();
+        writer.checkpoint().unwrap();
+        // Half a chunk more, not checkpointed: the file still reads as 10 pages.
+        for i in 10..15 {
+            writer.add(&page(i)).unwrap();
+        }
+        assert_eq!(pages_of(&path).0.len(), 10);
+        writer.flush_chunk().unwrap();
+        let (_, n, size) = writer.finish().unwrap();
+        assert_eq!((n, size), (15, std::fs::metadata(&path).unwrap().len()));
+        assert_eq!(
+            pages_of(&path),
+            ((0..15).map(page).collect(), Some(me.public_key()))
+        );
+
+        // Appending to someone else's signed file: same header size, signed as me now.
+        let theirs = temp("theirs.lost");
+        write(&theirs, 3, Some(&them));
+        let mut writer = Writer::append(&theirs, Some(&me)).unwrap();
+        writer.add(&page(3)).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(
+            pages_of(&theirs),
+            ((0..4).map(page).collect(), Some(me.public_key()))
+        );
+        assert_eq!(
+            Reader::open(&theirs).unwrap().header().query.as_deref(),
+            Some("example")
+        );
+
+        // Appending to an unsigned file: the header grows, the chunks move.
+        let plain = temp("plain-append.lost");
+        write(&plain, 12_000, None);
+        let mut writer = Writer::append(&plain, Some(&me)).unwrap();
+        for i in 12_000..12_005 {
+            writer.add(&page(i)).unwrap();
+        }
+        writer.finish().unwrap();
+        let (pages, signer) = pages_of(&plain);
+        assert_eq!(signer, Some(me.public_key()));
+        assert_eq!(pages.len(), 12_005);
+        assert_eq!(pages[11_999], page(11_999));
+        assert!(!PathBuf::from(format!("{}.part", plain.display())).exists());
+
+        // And back to unsigned, appending nothing.
+        let writer = Writer::append(&plain, None).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(pages_of(&plain).1, None);
+        assert_eq!(pages_of(&plain).0.len(), 12_005);
     }
 
     #[test]

@@ -1,0 +1,1594 @@
+//! What every spider shares: the queue of URLs, one request at a time per
+//! server with a delay between them, robots.txt, the blacklist, the checks
+//! against endless generated pages, and turning responses into pages.
+//! A protocol (gemini.rs, …) only fetches and parses.
+
+use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use lost::lostfile::Page;
+use lost::urls::Url;
+
+/// Requests can't be longer (Gemini's limit; a sane one for the others).
+const MAX_URL: usize = 1024;
+/// Redirects followed in a row.
+const MAX_HOPS: u8 = 5;
+/// A host that fails this many requests in a row is left alone for the rest
+/// of the crawl.
+const MAX_FAILURES: u8 = 3;
+/// More path segments than this, or one segment this many times, is a URL
+/// that generates itself (a calendar, a loop of relative links, …).
+const MAX_SEGMENTS: usize = 30;
+const MAX_REPEATS: usize = 3;
+/// The names whose robots.txt rules the spider obeys: everyone, the kinds
+/// of bot it is (Gemini's "virtual user agents"), and its own.
+const AGENTS: &[&str] = &["*", "indexer", "archiver", "lost-spider"];
+/// Files that are saved by their link alone, without asking the server.
+const FILE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "tif", "tiff", "heic", "avif", "mp3", "ogg",
+    "oga", "opus", "flac", "wav", "m4a", "aac", "mid", "mp4", "webm", "mkv", "avi", "mov", "m4v",
+    "pdf", "epub", "mobi", "djvu", "zip", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "tar",
+    "iso", "img", "exe", "msi", "deb", "rpm", "apk", "dmg", "jar", "woff", "woff2", "ttf", "otf",
+    "psd", "xcf", "sqlite", "db", "bin",
+];
+
+/// One network the spider can wander.
+pub trait Protocol: Send + Sync + 'static {
+    /// The URL scheme, which is also the pages' source: `gemini`.
+    const SCHEME: &'static str;
+    /// The network's name, for "Wandering …": `Geminispace`.
+    const SPACE: &'static str;
+    /// What its hosts are called: `capsules`.
+    const HOSTS: &'static str;
+
+    /// Where a crawl starts, besides `--link`.
+    fn seeds(&self) -> &'static [&'static str];
+
+    /// Asks `addr` for `url`. `Err` when the server can't be reached or
+    /// stops answering.
+    fn fetch(&self, addr: SocketAddr, url: &Url) -> Result<Response, String>;
+
+    /// A text document as a page.
+    fn parse(&self, url: &Url, mime: &str, body: &[u8]) -> Parsed;
+
+    /// The server's address.
+    fn resolve(&self, url: &Url, port: u16) -> Option<SocketAddr> {
+        let host = url.host.trim_start_matches('[').trim_end_matches(']');
+        (host, port).to_socket_addrs().ok()?.next()
+    }
+
+    /// The scheme's port.
+    fn port(&self) -> u16;
+}
+
+/// A server's answer, in the terms every protocol shares.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Response {
+    /// A document: its type, and its bytes if it's text.
+    Document { mime: String, body: Option<Vec<u8>> },
+    /// Moved: the new URL, maybe relative.
+    Redirect(String),
+    /// A box to type into. `sensitive` ones are for passwords.
+    Input { prompt: String, sensitive: bool },
+    /// Too many requests: wait this long.
+    SlowDown(Duration),
+    /// Not now; maybe later.
+    TryLater,
+    /// Not found, not allowed, or an answer that makes no sense.
+    Gone,
+}
+
+/// A text document, read.
+#[derive(Debug, Default)]
+pub struct Parsed {
+    pub title: Option<String>,
+    pub body: String,
+    pub links: Vec<Link>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Link {
+    /// Absolute.
+    pub url: String,
+    /// The link's text, if it has one.
+    pub label: Option<String>,
+}
+
+/// `scheme://` URLs written in text, as links without labels; punctuation
+/// right after them (`.`, `,`, `)`, …) isn't part of them.
+pub fn mentions(text: &str, scheme: &str) -> Vec<Link> {
+    let prefix = format!("{scheme}://");
+    let mut links = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(&prefix) {
+        let tail = &rest[i..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || "\"'<>[]{}|\\^`".contains(c))
+            .unwrap_or(tail.len());
+        let url = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')']);
+        if url.len() > prefix.len() && Url::parse(url).is_some() {
+            links.push(Link {
+                url: url.to_string(),
+                label: None,
+            });
+        }
+        rest = &tail[end.max(prefix.len())..];
+    }
+    links
+}
+
+// ── Settings ────────────────────────────────────────────────────────────
+
+pub struct Settings {
+    /// Between two requests to the same server.
+    pub delay: Duration,
+    /// Pages saved per host at most.
+    pub host_limit: Option<u64>,
+    /// Phrases to type into search boxes.
+    pub searches: Vec<String>,
+    pub blacklist: Blacklist,
+    /// `--dont-wander`: only these hosts (see [`host_key`]) are crawled.
+    pub only_hosts: Option<HashSet<String>>,
+    /// Requests running at once (to different servers).
+    pub workers: usize,
+}
+
+/// URLs and pages to skip (`--blacklist`), in the format LOST's import
+/// blocklist will use (ARCHITECTURE.md §9.2):
+///
+/// ```text
+/// # comment
+/// casino.example                 # a domain, with all its subdomains
+/// gemini://example.net/spam/     # URLs starting with this
+/// /\b(casino|viagra)\b/          # a regular expression on the URL
+/// title:/free bitcoin/           # … on the title
+/// body:/some phrase/             # … on the text
+/// 0.0.0.0 tracker.example        # hosts-file lines work too
+/// ```
+#[derive(Default)]
+pub struct Blacklist {
+    domains: HashSet<String>,
+    prefixes: Vec<String>,
+    urls: Vec<regex::Regex>,
+    titles: Vec<regex::Regex>,
+    bodies: Vec<regex::Regex>,
+}
+
+impl Blacklist {
+    pub fn load(path: &Path) -> lost::Result<Blacklist> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+        Blacklist::parse(&text).map_err(|e| format!("{}: {e}", path.display()).into())
+    }
+
+    pub fn parse(text: &str) -> Result<Blacklist, String> {
+        let mut list = Blacklist::default();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            let regex = |pattern: &str| {
+                regex::Regex::new(pattern).map_err(|e| format!("line {}: {e}", n + 1))
+            };
+            if let Some(pattern) = line.strip_prefix("title:/").and_then(regex_body) {
+                list.titles.push(regex(pattern)?);
+            } else if let Some(pattern) = line.strip_prefix("body:/").and_then(regex_body) {
+                list.bodies.push(regex(pattern)?);
+            } else if let Some(pattern) = line.strip_prefix('/').and_then(regex_body) {
+                list.urls.push(regex(pattern)?);
+            } else {
+                let line = without_comment(line);
+                let mut words = line.split_whitespace();
+                let Some(first) = words.next() else { continue };
+                if first.contains("://") {
+                    // Written the way the spider writes URLs, so they compare.
+                    let prefix = match Url::parse(first) {
+                        Some(url) if first.ends_with('/') || url.path != "/" => url.to_string(),
+                        Some(url) => url.to_string().trim_end_matches('/').to_string(),
+                        None => first.to_string(),
+                    };
+                    list.prefixes.push(prefix);
+                } else {
+                    let domain = match words.next() {
+                        Some(second) if first.parse::<IpAddr>().is_ok() => second,
+                        _ => first,
+                    };
+                    // As written and in punycode, so either spelling matches.
+                    let domain = domain.trim_end_matches('.').to_lowercase();
+                    if let Some(ascii) = lost::urls::ascii_host(&domain) {
+                        list.domains.insert(ascii);
+                    }
+                    list.domains.insert(domain);
+                }
+            }
+        }
+        Ok(list)
+    }
+
+    fn blocks_url(&self, url: &Url, text: &str) -> bool {
+        let ascii = lost::urls::ascii_host(&url.host);
+        for name in [Some(url.host.as_str()), ascii.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let mut host = name;
+            loop {
+                if self.domains.contains(host) {
+                    return true;
+                }
+                match host.split_once('.') {
+                    Some((_, parent)) => host = parent,
+                    None => break,
+                }
+            }
+        }
+        self.prefixes.iter().any(|p| text.starts_with(p.as_str()))
+            || self.urls.iter().any(|r| r.is_match(text))
+    }
+
+    fn blocks_page(&self, title: Option<&str>, body: &str) -> bool {
+        title.is_some_and(|t| self.titles.iter().any(|r| r.is_match(t)))
+            || self.bodies.iter().any(|r| r.is_match(body))
+    }
+}
+
+/// `pattern/   # comment` → `pattern`: the regular expression ends at the
+/// last `/` that only has a comment (or nothing) after it.
+fn regex_body(rest: &str) -> Option<&str> {
+    rest.match_indices('/').rev().find_map(|(i, _)| {
+        let after = rest[i + 1..].trim();
+        (after.is_empty() || after.starts_with('#')).then(|| &rest[..i])
+    })
+}
+
+fn without_comment(line: &str) -> &str {
+    if line.starts_with('#') {
+        return "";
+    }
+    match line.find(" #").or_else(|| line.find("\t#")) {
+        Some(i) => &line[..i],
+        None => line,
+    }
+}
+
+// ── robots.txt ──────────────────────────────────────────────────────────
+
+/// A host's robots.txt, as far as it concerns the spider: the rules of every
+/// group naming one of [`AGENTS`]. The longest matching rule decides
+/// (`Allow` if two are as long); `*` matches anything and `$` the end.
+#[derive(Debug, Clone, Default)]
+pub struct Robots {
+    rules: Vec<(bool, String)>,
+}
+
+impl Robots {
+    pub fn parse(text: &str) -> Robots {
+        let mut rules = Vec::new();
+        let mut in_agents = false;
+        let mut applies = false;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((field, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match field.trim().to_ascii_lowercase().as_str() {
+                "user-agent" => {
+                    if !in_agents {
+                        in_agents = true;
+                        applies = false;
+                    }
+                    applies |= AGENTS.iter().any(|a| a.eq_ignore_ascii_case(value));
+                }
+                rule @ ("allow" | "disallow") => {
+                    in_agents = false;
+                    if applies && !value.is_empty() {
+                        rules.push((rule == "allow", value.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Robots { rules }
+    }
+
+    pub fn allows(&self, url: &Url) -> bool {
+        let mut path = url.path.clone();
+        if let Some(query) = &url.query {
+            path.push('?');
+            path.push_str(query);
+        }
+        let mut best: Option<(usize, bool)> = None;
+        for (allow, pattern) in &self.rules {
+            if glob(pattern, &path) {
+                let len = pattern.len();
+                if best.is_none_or(|(l, a)| len > l || (len == l && *allow && !a)) {
+                    best = Some((len, *allow));
+                }
+            }
+        }
+        best.is_none_or(|(_, allow)| allow)
+    }
+}
+
+/// Does `path` start with `pattern`, where `*` is anything and a final `$`
+/// means "and ends there"?
+fn glob(pattern: &str, path: &str) -> bool {
+    let (pattern, anchored) = match pattern.strip_suffix('$') {
+        Some(p) => (p, true),
+        None => (pattern, false),
+    };
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let Some(mut rest) = path.strip_prefix(parts[0]) else {
+        return false;
+    };
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        if anchored && i == parts.len() - 1 {
+            return rest.ends_with(part);
+        }
+        match rest.find(part) {
+            Some(j) => rest = &rest[j + part.len()..],
+            None => return false,
+        }
+    }
+    !anchored || rest.is_empty()
+}
+
+// ── URLs ────────────────────────────────────────────────────────────────
+
+/// Spaces, controls and non-ASCII characters in the path and query,
+/// percent-encoded, as they're sent. An internationalized host stays as it's
+/// written (lowercased), so stored URLs read well; it's sent in punycode
+/// ([`on_the_wire`]).
+fn clean(mut url: Url) -> Url {
+    fn encode(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for c in text.chars() {
+            if c.is_ascii_graphic() {
+                out.push(c);
+            } else {
+                let mut bytes = [0u8; 4];
+                for b in c.encode_utf8(&mut bytes).bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+        }
+        out
+    }
+    if !url.host.is_ascii() {
+        url.host = url.host.to_lowercase();
+    }
+    url.path = encode(&url.path);
+    url.query = url.query.as_deref().map(encode);
+    url.fragment = None;
+    url
+}
+
+/// What a search box is sent: everything but letters, digits and `-._~`
+/// percent-encoded.
+fn encode_query(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(h << 4 | l);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A URL that keeps generating more of itself.
+fn looks_like_trap(url: &Url) -> bool {
+    let segments: Vec<&str> = url.path.split('/').filter(|s| !s.is_empty()).collect();
+    segments.len() > MAX_SEGMENTS
+        || segments
+            .iter()
+            .any(|s| segments.iter().filter(|t| *t == s).count() >= MAX_REPEATS)
+}
+
+/// The prompt of a box to type into looks like it's for searching, not for
+/// posting: guestbooks, comments and replies look the same in Gemini, and
+/// the spider never writes anything anywhere.
+fn looks_like_search(prompt: &str, url: &Url) -> bool {
+    const SEARCH: &[&str] = &["search", "query", "find", "look up", "lookup", "keyword"];
+    const NOT: &[&str] = &[
+        "comment",
+        "guestbook",
+        "guest book",
+        "message",
+        "reply",
+        "post",
+        "password",
+        "passphrase",
+        "sign",
+        "say",
+        "write",
+        "name",
+        "mail",
+        "token",
+        "captcha",
+        "secret",
+    ];
+    let text = format!("{prompt} {}", url.path).to_lowercase();
+    SEARCH.iter().any(|w| text.contains(w)) && !NOT.iter().any(|w| text.contains(w))
+}
+
+/// `host`, or `host:port` for a port that isn't the scheme's; punycode for
+/// an internationalized host, so both spellings are one host.
+pub fn host_key(url: &Url) -> String {
+    let host = lost::urls::ascii_host(&url.host).unwrap_or_else(|| url.host.clone());
+    match url.port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+/// The URL as it's sent: its host in punycode.
+fn on_the_wire(url: &Url) -> Url {
+    let mut url = url.clone();
+    if let Some(ascii) = lost::urls::ascii_host(&url.host) {
+        url.host = ascii;
+    }
+    url
+}
+
+fn hash(value: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// URLs that are the same page to LOST are fetched once.
+fn seen_key(url: &Url) -> u64 {
+    hash(&on_the_wire(url).normalized())
+}
+
+/// A title for a page that has none of its own: the link's text, the file's
+/// name, or the host.
+fn fallback_title(url: &Url, label: Option<&str>) -> String {
+    if let Some(label) = label {
+        return label.to_string();
+    }
+    match url.path.rsplit('/').find(|s| !s.is_empty()) {
+        Some(name) => percent_decode(name),
+        None => url.host.clone(),
+    }
+}
+
+// ── What's already in the file ──────────────────────────────────────────
+
+/// What a crawl being continued (`-c`) already has: its pages' URLs, texts
+/// and links. The queue is rebuilt from the links (ARCHITECTURE.md §15.3).
+#[derive(Default)]
+pub struct Known {
+    seen: HashSet<u64>,
+    contents: HashSet<u64>,
+    saved: HashMap<String, u64>,
+    links: Vec<String>,
+}
+
+impl Known {
+    pub fn add(&mut self, page: Page, scheme: &str) {
+        let Some(url) = Url::parse(&page.url) else {
+            return;
+        };
+        self.seen.insert(seen_key(&url));
+        if !page.body.is_empty() {
+            self.contents.insert(hash(&page.body));
+        }
+        if url.scheme == scheme {
+            *self.saved.entry(host_key(&url)).or_default() += 1;
+        }
+        self.links.extend(page.links);
+    }
+}
+
+// ── The crawl ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Kind {
+    /// A host's robots.txt, asked for before anything else there.
+    Robots,
+    /// A page to save.
+    Page,
+    /// A search's results: their links are followed, the page isn't saved.
+    Results,
+}
+
+#[derive(Debug, Clone)]
+struct Job {
+    url: Url,
+    label: Option<String>,
+    kind: Kind,
+    tries: u8,
+    hops: u8,
+}
+
+/// A host (and port).
+struct Host {
+    origin: Url,
+    queue: VecDeque<Job>,
+    robots: Option<Robots>,
+    addr: Option<SocketAddr>,
+    /// In its server's round of hosts.
+    listed: bool,
+    failures: u8,
+    /// Unreachable, or out of `--host-limit`: nothing more is asked of it.
+    done: bool,
+    saved: u64,
+}
+
+/// One IP address: one request at a time, `delay` apart.
+struct Server {
+    hosts: VecDeque<String>,
+    busy: bool,
+    /// In `ready`.
+    scheduled: bool,
+    next: Instant,
+}
+
+#[derive(Default)]
+struct State {
+    /// The protocol's.
+    scheme: &'static str,
+    hosts: HashMap<String, Host>,
+    servers: HashMap<IpAddr, Server>,
+    /// Servers with something to ask, by when they may be asked.
+    ready: BinaryHeap<Reverse<(Instant, u64, IpAddr)>>,
+    order: u64,
+    unresolved: VecDeque<String>,
+    seen: HashSet<u64>,
+    contents: HashSet<u64>,
+    saved_before: HashMap<String, u64>,
+    /// Jobs queued.
+    waiting: u64,
+    /// Tasks being worked on.
+    active: usize,
+    /// Of which, host names being looked up.
+    resolving: usize,
+}
+
+enum Task {
+    Resolve(String, Url),
+    /// A file saved by its link alone.
+    Save(Page),
+    Fetch {
+        ip: IpAddr,
+        key: String,
+        addr: SocketAddr,
+        job: Job,
+    },
+}
+
+enum Next {
+    Task(Box<Task>),
+    Wait(Option<Instant>),
+    Done,
+}
+
+/// What a fetch came to, worked out without holding the lock.
+enum Outcome {
+    Robots(Robots),
+    Page {
+        page: Page,
+        content: Option<u64>,
+        blocked: bool,
+        links: Vec<Link>,
+    },
+    Follow(Vec<Link>),
+    Redirect(Url),
+    Search(Vec<Url>),
+    SlowDown(Duration),
+    Retry,
+    Nothing,
+    Failed,
+}
+
+fn schedule(
+    server: &mut Server,
+    ip: IpAddr,
+    ready: &mut BinaryHeap<Reverse<(Instant, u64, IpAddr)>>,
+    order: &mut u64,
+) {
+    if !server.busy && !server.scheduled && !server.hosts.is_empty() {
+        *order += 1;
+        ready.push(Reverse((server.next, *order, ip)));
+        server.scheduled = true;
+    }
+}
+
+impl State {
+    fn enqueue(
+        &mut self,
+        url: Url,
+        label: Option<String>,
+        kind: Kind,
+        hops: u8,
+        settings: &Settings,
+    ) -> bool {
+        if url.scheme != self.scheme || lost::urls::ascii_host(&url.host).is_none() {
+            return false;
+        }
+        let url = clean(url);
+        let text = url.to_string();
+        if text.len() > MAX_URL
+            || looks_like_trap(&url)
+            || settings.blacklist.blocks_url(&url, &text)
+        {
+            return false;
+        }
+        let key = host_key(&url);
+        if settings
+            .only_hosts
+            .as_ref()
+            .is_some_and(|only| !only.contains(&key))
+        {
+            return false;
+        }
+        if !self.seen.insert(seen_key(&url)) {
+            return false;
+        }
+        let host = match self.hosts.entry(key.clone()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                // Asked in punycode: looked up, robots.txt.
+                let mut origin = on_the_wire(&url);
+                origin.path = "/".into();
+                origin.query = None;
+                let mut robots = origin.clone();
+                robots.path = "/robots.txt".into();
+                let saved = self.saved_before.get(&key).copied().unwrap_or(0);
+                let done = settings.host_limit.is_some_and(|limit| saved >= limit);
+                let mut queue = VecDeque::new();
+                if !done {
+                    queue.push_back(Job {
+                        url: robots,
+                        label: None,
+                        kind: Kind::Robots,
+                        tries: 0,
+                        hops: 0,
+                    });
+                    self.unresolved.push_back(key.clone());
+                    self.waiting += 1;
+                }
+                e.insert(Host {
+                    origin,
+                    queue,
+                    robots: None,
+                    addr: None,
+                    listed: false,
+                    failures: 0,
+                    done,
+                    saved,
+                })
+            }
+        };
+        if host.done {
+            return false;
+        }
+        host.queue.push_back(Job {
+            url,
+            label,
+            kind,
+            tries: 0,
+            hops,
+        });
+        self.waiting += 1;
+        if let Some(addr) = host.addr
+            && !host.listed
+        {
+            host.listed = true;
+            let server = self
+                .servers
+                .get_mut(&addr.ip())
+                .expect("a resolved host has a server");
+            server.hosts.push_back(key);
+            schedule(server, addr.ip(), &mut self.ready, &mut self.order);
+        }
+        true
+    }
+
+    /// Puts a job back in its host's queue (it's been seen already).
+    fn requeue(&mut self, key: &str, job: Job, front: bool) {
+        let Some(host) = self.hosts.get_mut(key) else {
+            return;
+        };
+        if host.done {
+            return;
+        }
+        if front {
+            host.queue.push_front(job);
+        } else {
+            host.queue.push_back(job);
+        }
+        self.waiting += 1;
+        if let Some(addr) = host.addr
+            && !host.listed
+        {
+            host.listed = true;
+            if let Some(server) = self.servers.get_mut(&addr.ip()) {
+                server.hosts.push_back(key.to_string());
+            }
+        }
+    }
+
+    /// Nothing more is asked of this host.
+    fn retire(&mut self, key: &str) {
+        if let Some(host) = self.hosts.get_mut(key) {
+            host.done = true;
+            self.waiting -= host.queue.len() as u64;
+            host.queue.clear();
+        }
+    }
+
+    fn next(&mut self, now: Instant, settings: &Settings) -> Next {
+        // At most half the workers look up host names while there are
+        // servers to ask: a crawl that starts with thousands of new hosts
+        // (as a continued one does) mustn't spend its first minutes only
+        // looking them up, many of them dead.
+        if self.resolving < settings.workers.div_ceil(2)
+            && let Some(task) = self.resolve_task()
+        {
+            return task;
+        }
+        let wait = match self.fetch_task(now, settings) {
+            Ok(task) => return task,
+            Err(wait) => wait,
+        };
+        // No server to ask right now: an idle worker may as well look one up.
+        if let Some(task) = self.resolve_task() {
+            return task;
+        }
+        if self.active == 0 && self.unresolved.is_empty() {
+            Next::Done
+        } else {
+            Next::Wait(wait)
+        }
+    }
+
+    fn resolve_task(&mut self) -> Option<Next> {
+        let key = self.unresolved.pop_front()?;
+        let origin = self.hosts[&key].origin.clone();
+        self.active += 1;
+        self.resolving += 1;
+        Some(Next::Task(Box::new(Task::Resolve(key, origin))))
+    }
+
+    /// The next request (or file saved by its link) a server is ready for;
+    /// otherwise when one will be, if one has anything to ask.
+    fn fetch_task(&mut self, now: Instant, settings: &Settings) -> Result<Next, Option<Instant>> {
+        while let Some(&Reverse((at, _, ip))) = self.ready.peek() {
+            if at > now {
+                return Err(Some(at));
+            }
+            self.ready.pop();
+            let Some(server) = self.servers.get_mut(&ip) else {
+                continue;
+            };
+            server.scheduled = false;
+            while let Some(key) = server.hosts.pop_front() {
+                let host = self.hosts.get_mut(&key).expect("listed hosts exist");
+                let Some(job) = host.queue.pop_front() else {
+                    host.listed = false;
+                    continue;
+                };
+                self.waiting -= 1;
+                if host.queue.is_empty() {
+                    host.listed = false;
+                } else {
+                    server.hosts.push_back(key.clone());
+                }
+                if job.kind != Kind::Robots {
+                    if host.robots.as_ref().is_some_and(|r| !r.allows(&job.url)) {
+                        continue;
+                    }
+                    if settings.host_limit.is_some_and(|limit| host.saved >= limit) {
+                        host.done = true;
+                        self.waiting -= host.queue.len() as u64;
+                        host.queue.clear();
+                        continue;
+                    }
+                    let is_file = job
+                        .url
+                        .extension()
+                        .is_some_and(|e| FILE_EXTENSIONS.contains(&e.as_str()));
+                    if job.kind == Kind::Page && is_file {
+                        host.saved += 1;
+                        schedule(server, ip, &mut self.ready, &mut self.order);
+                        self.active += 1;
+                        return Ok(Next::Task(Box::new(Task::Save(Page {
+                            title: Some(fallback_title(&job.url, job.label.as_deref())),
+                            url: job.url.to_string(),
+                            sources: vec![self.scheme.to_string()],
+                            crawled: Some(lost::store::now()),
+                            ..Page::default()
+                        }))));
+                    }
+                }
+                let addr = host.addr.expect("listed hosts are resolved");
+                server.busy = true;
+                self.active += 1;
+                return Ok(Next::Task(Box::new(Task::Fetch { ip, key, addr, job })));
+            }
+        }
+        Err(None)
+    }
+
+    fn resolved(&mut self, key: &str, addr: Option<SocketAddr>) {
+        self.active -= 1;
+        self.resolving -= 1;
+        let Some(addr) = addr else {
+            self.retire(key);
+            return;
+        };
+        let host = self.hosts.get_mut(key).expect("resolved hosts exist");
+        host.addr = Some(addr);
+        if host.done || host.queue.is_empty() {
+            return;
+        }
+        host.listed = true;
+        let server = self.servers.entry(addr.ip()).or_insert_with(|| Server {
+            hosts: VecDeque::new(),
+            busy: false,
+            scheduled: false,
+            next: Instant::now(),
+        });
+        server.hosts.push_back(key.to_string());
+        schedule(server, addr.ip(), &mut self.ready, &mut self.order);
+    }
+
+    /// Takes in what a fetch came to; returns the page to save, if any.
+    fn fetched(
+        &mut self,
+        ip: IpAddr,
+        key: &str,
+        job: Job,
+        outcome: Outcome,
+        settings: &Settings,
+    ) -> Option<Page> {
+        self.active -= 1;
+        let now = Instant::now();
+        let mut next = now + settings.delay;
+        let mut page_out = None;
+
+        let failed = matches!(outcome, Outcome::Failed);
+        if let Some(host) = self.hosts.get_mut(key) {
+            host.failures = if failed { host.failures + 1 } else { 0 };
+        }
+        match outcome {
+            Outcome::Failed => {
+                let failures = self.hosts.get_mut(key).map_or(MAX_FAILURES, |host| {
+                    if job.kind == Kind::Robots {
+                        // No rules to go by: whatever comes next decides.
+                        host.robots = Some(Robots::default());
+                    }
+                    host.failures
+                });
+                if failures >= MAX_FAILURES {
+                    self.retire(key);
+                } else if job.kind != Kind::Robots && job.tries == 0 {
+                    self.requeue(key, Job { tries: 1, ..job }, false);
+                }
+            }
+            Outcome::Robots(robots) => {
+                if let Some(host) = self.hosts.get_mut(key) {
+                    host.robots = Some(robots);
+                }
+            }
+            Outcome::Page {
+                page,
+                content,
+                blocked,
+                links,
+            } => {
+                let new = content.is_none_or(|c| self.contents.insert(c));
+                if new && !blocked {
+                    if let Some(host) = self.hosts.get_mut(key) {
+                        host.saved += 1;
+                    }
+                    for link in links {
+                        if let Some(url) = Url::parse(&link.url) {
+                            self.enqueue(url, link.label, Kind::Page, 0, settings);
+                        }
+                    }
+                    page_out = Some(page);
+                }
+            }
+            Outcome::Follow(links) => {
+                for link in links {
+                    if let Some(url) = Url::parse(&link.url) {
+                        self.enqueue(url, link.label, Kind::Page, 0, settings);
+                    }
+                }
+            }
+            Outcome::Redirect(url) => {
+                if job.hops < MAX_HOPS {
+                    self.enqueue(url, job.label, job.kind, job.hops + 1, settings);
+                }
+            }
+            Outcome::Search(urls) => {
+                for url in urls {
+                    self.enqueue(url, None, Kind::Results, 0, settings);
+                }
+            }
+            Outcome::SlowDown(wait) => {
+                next = now + wait.max(settings.delay);
+                if job.tries < 3 {
+                    self.requeue(
+                        key,
+                        Job {
+                            tries: job.tries + 1,
+                            ..job
+                        },
+                        true,
+                    );
+                }
+            }
+            Outcome::Retry => {
+                if job.tries < 2 {
+                    self.requeue(
+                        key,
+                        Job {
+                            tries: job.tries + 1,
+                            ..job
+                        },
+                        false,
+                    );
+                }
+            }
+            Outcome::Nothing => {}
+        }
+
+        if let Some(server) = self.servers.get_mut(&ip) {
+            server.busy = false;
+            server.next = next;
+            schedule(server, ip, &mut self.ready, &mut self.order);
+        }
+        page_out
+    }
+}
+
+/// How a crawl is going, for the status line.
+pub struct Stats {
+    pub hosts: usize,
+    pub waiting: u64,
+}
+
+pub struct Crawler<P: Protocol> {
+    protocol: P,
+    settings: Settings,
+    state: Mutex<State>,
+    wake: Condvar,
+    stop: AtomicBool,
+}
+
+impl<P: Protocol> Crawler<P> {
+    /// A crawl starting at `links` (first), the protocol's seeds and the
+    /// links of the pages it `known`s already.
+    pub fn new(protocol: P, settings: Settings, known: Known, links: &[String]) -> Arc<Crawler<P>> {
+        let mut state = State {
+            scheme: P::SCHEME,
+            seen: known.seen,
+            contents: known.contents,
+            saved_before: known.saved,
+            ..State::default()
+        };
+        // With --dont-wander, the links are where to go: no seeds.
+        let seeds: &[&str] = match settings.only_hosts {
+            Some(_) => &[],
+            None => protocol.seeds(),
+        };
+        let start = links
+            .iter()
+            .map(String::as_str)
+            .chain(seeds.iter().copied())
+            // Newest first: links from the file's last pages are where the
+            // crawl stopped. Older ones still not crawled are mostly ones
+            // that failed before (dead hosts, errors), so they come last.
+            .chain(known.links.iter().rev().map(String::as_str));
+        for link in start {
+            if let Some(url) = Url::parse(link) {
+                state.enqueue(url, None, Kind::Page, 0, &settings);
+            }
+        }
+        Arc::new(Crawler {
+            protocol,
+            settings,
+            state: Mutex::new(state),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    /// Starts the workers. Pages go to `out`; when the crawl is over (or
+    /// stopped), every worker has dropped its copy of it.
+    pub fn start(self: &Arc<Self>, out: SyncSender<Page>) {
+        for _ in 0..self.settings.workers.max(1) {
+            let crawler = self.clone();
+            let out = out.clone();
+            std::thread::spawn(move || crawler.work(out));
+        }
+    }
+
+    /// Asks the workers to stop; requests under way are left to time out.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
+    pub fn stats(&self) -> Stats {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Stats {
+            hosts: state.hosts.len(),
+            waiting: state.waiting,
+        }
+    }
+
+    fn work(&self, out: SyncSender<Page>) {
+        loop {
+            let task = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let now = Instant::now();
+                    match state.next(now, &self.settings) {
+                        Next::Task(task) => break task,
+                        Next::Done => {
+                            self.wake.notify_all();
+                            return;
+                        }
+                        Next::Wait(until) => {
+                            let wait = until
+                                .map_or(Duration::from_secs(1), |t| t - now)
+                                .min(Duration::from_secs(1));
+                            state = self
+                                .wake
+                                .wait_timeout(state, wait)
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0;
+                        }
+                    }
+                }
+            };
+            match *task {
+                Task::Resolve(key, origin) => {
+                    let addr = self
+                        .protocol
+                        .resolve(&origin, origin.port.unwrap_or(self.protocol.port()));
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .resolved(&key, addr);
+                }
+                Task::Save(page) => {
+                    self.state.lock().unwrap_or_else(|e| e.into_inner()).active -= 1;
+                    if out.send(page).is_err() {
+                        return;
+                    }
+                }
+                Task::Fetch { ip, key, addr, job } => {
+                    let response = self.protocol.fetch(addr, &on_the_wire(&job.url));
+                    let outcome = self.outcome(&job, response);
+                    let page = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .fetched(ip, &key, job, outcome, &self.settings);
+                    if let Some(page) = page
+                        && out.send(page).is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            self.wake.notify_all();
+        }
+    }
+
+    fn outcome(&self, job: &Job, response: Result<Response, String>) -> Outcome {
+        let Ok(response) = response else {
+            return Outcome::Failed;
+        };
+        if job.kind == Kind::Robots {
+            return match response {
+                Response::Document {
+                    body: Some(body), ..
+                } => Outcome::Robots(Robots::parse(&String::from_utf8_lossy(&body))),
+                _ => Outcome::Robots(Robots::default()),
+            };
+        }
+        match response {
+            Response::Document {
+                mime,
+                body: Some(body),
+            } => {
+                let parsed = self.protocol.parse(&job.url, &mime, &body);
+                if job.kind == Kind::Results {
+                    return Outcome::Follow(parsed.links);
+                }
+                let title = parsed
+                    .title
+                    .unwrap_or_else(|| fallback_title(&job.url, job.label.as_deref()));
+                let blocked = self
+                    .settings
+                    .blacklist
+                    .blocks_page(Some(&title), &parsed.body);
+                Outcome::Page {
+                    content: (!parsed.body.is_empty()).then(|| hash(&parsed.body)),
+                    blocked,
+                    page: Page {
+                        url: job.url.to_string(),
+                        sources: vec![P::SCHEME.to_string()],
+                        title: Some(title),
+                        body: parsed.body,
+                        links: parsed.links.iter().map(|l| l.url.clone()).collect(),
+                        crawled: Some(lost::store::now()),
+                    },
+                    links: parsed.links,
+                }
+            }
+            Response::Document { body: None, .. } => Outcome::Page {
+                page: Page {
+                    url: job.url.to_string(),
+                    sources: vec![P::SCHEME.to_string()],
+                    title: Some(fallback_title(&job.url, job.label.as_deref())),
+                    crawled: Some(lost::store::now()),
+                    ..Page::default()
+                },
+                content: None,
+                blocked: false,
+                links: Vec::new(),
+            },
+            Response::Redirect(target) => match lost::urls::resolve_any(&job.url, &target) {
+                Some(url) => Outcome::Redirect(url),
+                None => Outcome::Nothing,
+            },
+            Response::Input { prompt, sensitive } => {
+                if sensitive
+                    || self.settings.searches.is_empty()
+                    || !looks_like_search(&prompt, &job.url)
+                {
+                    return Outcome::Nothing;
+                }
+                let urls = self
+                    .settings
+                    .searches
+                    .iter()
+                    .map(|phrase| {
+                        let mut url = job.url.clone();
+                        url.query = Some(encode_query(phrase));
+                        url
+                    })
+                    .collect();
+                Outcome::Search(urls)
+            }
+            Response::SlowDown(wait) => Outcome::SlowDown(wait),
+            Response::TryLater => Outcome::Retry,
+            Response::Gone => Outcome::Nothing,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn robots_rules() {
+        let robots = Robots::parse(
+            "User-agent: googlebot\nDisallow: /\n\n\
+             User-agent: indexer\nUser-agent: researcher\nDisallow: /private/\nAllow: /private/ok\n\n\
+             User-agent: *\nDisallow: /cgi-bin/*.cgi$\nDisallow: /search # no searching\nDisallow:\n",
+        );
+        let allows = |path: &str| robots.allows(&Url::parse(&format!("gemini://x{path}")).unwrap());
+        assert!(allows("/"));
+        assert!(allows("/gemlog/"));
+        assert!(!allows("/private/diary.gmi"));
+        assert!(allows("/private/ok.gmi"));
+        assert!(!allows("/cgi-bin/calc.cgi"));
+        assert!(allows("/cgi-bin/calc.cgi/more"));
+        assert!(!allows("/search?cats"));
+        assert!(Robots::default().allows(&Url::parse("gemini://x/a").unwrap()));
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob("/a", "/abc"));
+        assert!(!glob("/b", "/abc"));
+        assert!(glob("/a*c", "/abc"));
+        assert!(glob("/*.gmi$", "/x/y.gmi"));
+        assert!(!glob("/*.gmi$", "/x/y.gmi?q"));
+        assert!(glob("/x$", "/x"));
+        assert!(!glob("/x$", "/xy"));
+    }
+
+    #[test]
+    fn blacklists() {
+        let list = Blacklist::parse(
+            "# a comment\n\
+             casino.example   # a domain\n\
+             0.0.0.0 tracker.example\n\
+             bücher.example\n\
+             gemini://example.net/spam/\n\
+             /\\/commits?\\/[0-9a-f]{40}/   # git\n\
+             title:/(?i)free bitcoin/\n\
+             body:/buy now/\n",
+        )
+        .unwrap();
+        let blocks = |u: &str| {
+            let url = Url::parse(u).unwrap();
+            list.blocks_url(&url, &url.to_string())
+        };
+        assert!(blocks("gemini://casino.example/"));
+        assert!(blocks("gemini://www.casino.example/x"));
+        assert!(!blocks("gemini://notcasino.example/"));
+        assert!(blocks("gemini://tracker.example/"));
+        assert!(blocks("gemini://bücher.example/"));
+        assert!(blocks("gemini://shop.xn--bcher-kva.example/"));
+        assert!(blocks("gemini://example.net/spam/1.gmi"));
+        assert!(!blocks("gemini://example.net/ham/"));
+        assert!(blocks(&format!("gemini://git.x/commit/{}", "a".repeat(40))));
+        assert!(list.blocks_page(Some("FREE Bitcoin here"), ""));
+        assert!(list.blocks_page(None, "please buy now"));
+        assert!(!list.blocks_page(Some("Bitcoin"), "hello"));
+        assert!(Blacklist::parse("/(unclosed/").is_err());
+    }
+
+    #[test]
+    fn urls() {
+        let url = clean(Url::parse("gemini://x/a b/é?q r").unwrap());
+        assert_eq!(url.to_string(), "gemini://x/a%20b/%C3%A9?q%20r");
+        assert_eq!(encode_query("cats & dogs"), "cats%20%26%20dogs");
+        assert_eq!(percent_decode("caf%C3%A9%20menu.gmi"), "café menu.gmi");
+        assert!(looks_like_trap(
+            &Url::parse("gemini://x/a/b/a/b/a/b").unwrap()
+        ));
+        assert!(!looks_like_trap(&Url::parse("gemini://x/a/b/c/d").unwrap()));
+        let at = |path: &str| Url::parse(&format!("gemini://x{path}")).unwrap();
+        assert!(looks_like_search("Search the archive", &at("/")));
+        assert!(looks_like_search("Enter terms", &at("/search")));
+        assert!(!looks_like_search("Leave a comment", &at("/post")));
+        assert!(!looks_like_search("Search posts", &at("/")));
+        assert!(!looks_like_search("Your name?", &at("/guestbook")));
+        assert_eq!(
+            mentions("see gemini://a.b/c.gmi, and (gemini://d.e/).", "gemini")
+                .into_iter()
+                .map(|l| l.url)
+                .collect::<Vec<_>>(),
+            ["gemini://a.b/c.gmi", "gemini://d.e/"]
+        );
+        assert_eq!(
+            fallback_title(&at("/files/My%20cat.jpg"), None),
+            "My cat.jpg"
+        );
+        assert_eq!(fallback_title(&at("/"), None), "x");
+        assert_eq!(fallback_title(&at("/a"), Some("Link")), "Link");
+        let idn = clean(Url::parse("gemini://Café.example/x").unwrap());
+        assert_eq!(idn.host, "café.example");
+        assert_eq!(host_key(&idn), "xn--caf-dma.example");
+        assert_eq!(
+            on_the_wire(&idn).to_string(),
+            "gemini://xn--caf-dma.example/x"
+        );
+        assert_eq!(
+            seen_key(&idn),
+            seen_key(&Url::parse("gemini://xn--caf-dma.example/x").unwrap())
+        );
+    }
+
+    /// A tiny Geminispace in memory.
+    struct Fake {
+        pages: HashMap<String, Response>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Protocol for Fake {
+        const SCHEME: &'static str = "gemini";
+        const SPACE: &'static str = "Fakespace";
+        const HOSTS: &'static str = "hosts";
+
+        fn seeds(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn fetch(&self, _: SocketAddr, url: &Url) -> Result<Response, String> {
+            let url = url.to_string();
+            self.asked.lock().unwrap().push(url.clone());
+            if url.contains("down.test") {
+                return Err("unreachable".into());
+            }
+            Ok(self.pages.get(&url).cloned().unwrap_or(Response::Gone))
+        }
+
+        fn parse(&self, url: &Url, _: &str, body: &[u8]) -> Parsed {
+            let text = String::from_utf8_lossy(body);
+            let links = text
+                .split_whitespace()
+                .filter_map(|w| w.strip_prefix("=>"))
+                .filter_map(|target| lost::urls::resolve_any(url, target))
+                .map(|u| Link {
+                    url: u.to_string(),
+                    label: None,
+                })
+                .collect();
+            Parsed {
+                title: None,
+                body: text.into_owned(),
+                links,
+            }
+        }
+
+        fn resolve(&self, url: &Url, port: u16) -> Option<SocketAddr> {
+            // Every *.test host lives on one server, except nowhere.test.
+            (!url.host.starts_with("nowhere")).then(|| SocketAddr::from(([127, 0, 0, 1], port)))
+        }
+
+        fn port(&self) -> u16 {
+            1965
+        }
+    }
+
+    fn doc(text: &str) -> Response {
+        Response::Document {
+            mime: "text/gemini".into(),
+            body: Some(text.as_bytes().to_vec()),
+        }
+    }
+
+    fn crawl(
+        pages: Vec<(&str, Response)>,
+        settings: Settings,
+        known: Known,
+        links: &[&str],
+    ) -> (Vec<Page>, Vec<String>) {
+        let fake = Fake {
+            pages: pages.into_iter().map(|(u, r)| (u.to_string(), r)).collect(),
+            asked: Mutex::new(Vec::new()),
+        };
+        let links: Vec<String> = links.iter().map(|l| l.to_string()).collect();
+        let crawler = Crawler::new(fake, settings, known, &links);
+        let (tx, rx) = std::sync::mpsc::sync_channel(100);
+        crawler.start(tx);
+        let mut saved: Vec<Page> = rx.iter().collect();
+        saved.sort_by(|a, b| a.url.cmp(&b.url));
+        let asked = crawler.protocol.asked.lock().unwrap().clone();
+        (saved, asked)
+    }
+
+    fn settings() -> Settings {
+        Settings {
+            delay: Duration::ZERO,
+            host_limit: None,
+            searches: Vec::new(),
+            blacklist: Blacklist::default(),
+            only_hosts: None,
+            workers: 4,
+        }
+    }
+
+    #[test]
+    fn a_small_crawl() {
+        let pages = vec![
+            (
+                "gemini://a.test/",
+                doc(
+                    "Home =>/about =>gemini://b.test/ =>/pic.png =>/secret/x =>gemini://down.test/ =>gemini://nowhere.test/",
+                ),
+            ),
+            (
+                "gemini://a.test/robots.txt",
+                doc("User-agent: indexer\nDisallow: /secret/"),
+            ),
+            ("gemini://a.test/about", doc("About =>/ =>/old")),
+            ("gemini://a.test/old", Response::Redirect("/new".into())),
+            ("gemini://a.test/new", doc("Moved here")),
+            ("gemini://b.test/", doc("Home")),
+            ("gemini://b.test/copy", doc("Home")),
+            (
+                "gemini://b.test/search",
+                Response::Input {
+                    prompt: "Search".into(),
+                    sensitive: false,
+                },
+            ),
+            ("gemini://b.test/search?cats", doc("Results =>/cats")),
+            ("gemini://b.test/cats", doc("Meow")),
+            (
+                "gemini://b.test/login",
+                Response::Input {
+                    prompt: "Search".into(),
+                    sensitive: true,
+                },
+            ),
+            (
+                "gemini://b.test/comment",
+                Response::Input {
+                    prompt: "Leave a comment".into(),
+                    sensitive: false,
+                },
+            ),
+        ];
+        let settings = Settings {
+            searches: vec!["cats".into()],
+            ..settings()
+        };
+        let links = [
+            "gemini://a.test/",
+            "gemini://b.test/search",
+            "gemini://b.test/login",
+            "gemini://b.test/comment",
+            "gemini://b.test/copy",
+        ];
+        let (saved, asked) = crawl(pages, settings, Known::default(), &links);
+        // b.test's home page and its copy have the same text: one is saved,
+        // whichever came first.
+        let copies = saved
+            .iter()
+            .filter(|p| p.url == "gemini://b.test/" || p.url == "gemini://b.test/copy")
+            .count();
+        assert_eq!(copies, 1);
+        let urls: Vec<&str> = saved
+            .iter()
+            .map(|p| p.url.as_str())
+            .filter(|u| !u.starts_with("gemini://b.test/") || u.ends_with("cats"))
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "gemini://a.test/",
+                "gemini://a.test/about",
+                "gemini://a.test/new",
+                "gemini://a.test/pic.png",
+                "gemini://b.test/cats",
+            ]
+        );
+        // The picture was saved without asking for it; the secret wasn't asked
+        // for; the search results weren't saved; the copy of b.test's home
+        // page wasn't saved twice; nothing was typed into the other boxes.
+        assert!(
+            !asked
+                .iter()
+                .any(|u| u.ends_with("pic.png") || u.contains("secret"))
+        );
+        assert!(asked.contains(&"gemini://b.test/search?cats".to_string()));
+        assert!(
+            !asked
+                .iter()
+                .any(|u| u.contains("login?") || u.contains("comment?"))
+        );
+        assert_eq!(saved[3].title.as_deref(), Some("pic.png"));
+        assert_eq!(saved[0].sources, ["gemini"]);
+        // An unreachable host is asked a few times, then left alone.
+        assert!(asked.iter().filter(|u| u.contains("down.test")).count() <= MAX_FAILURES as usize);
+        assert!(asked.iter().all(|u| !u.contains("nowhere.test")));
+    }
+
+    #[test]
+    fn internationalized_hosts() {
+        // Asked for in punycode, saved as written; one host, either spelling.
+        let pages = vec![
+            (
+                "gemini://xn--caf-dma.test/",
+                doc("Menu =>gemini://xn--caf-dma.test/ =>/tea"),
+            ),
+            ("gemini://xn--caf-dma.test/tea", doc("Tea")),
+        ];
+        let (saved, asked) = crawl(
+            pages,
+            settings(),
+            Known::default(),
+            &["gemini://Café.test/"],
+        );
+        let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(urls, ["gemini://café.test/", "gemini://café.test/tea"]);
+        assert!(asked.iter().all(|u| u.is_ascii()));
+        assert_eq!(asked.iter().filter(|u| u.ends_with(".test/")).count(), 1);
+    }
+
+    #[test]
+    fn not_wandering() {
+        let pages = vec![
+            (
+                "gemini://a.test/",
+                doc("Home =>/1 =>gemini://b.test/ =>gemini://c.test/"),
+            ),
+            ("gemini://a.test/1", doc("One")),
+            ("gemini://b.test/", doc("B =>/2")),
+            ("gemini://b.test/2", doc("Two")),
+            ("gemini://c.test/", doc("C")),
+        ];
+        let only = Settings {
+            only_hosts: Some(["a.test".to_string(), "b.test".to_string()].into()),
+            ..settings()
+        };
+        let (saved, asked) = crawl(pages, only, Known::default(), &["gemini://a.test/"]);
+        let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "gemini://a.test/",
+                "gemini://a.test/1",
+                "gemini://b.test/",
+                "gemini://b.test/2"
+            ]
+        );
+        assert!(!asked.iter().any(|u| u.contains("c.test")));
+    }
+
+    #[test]
+    fn continuing_and_limits() {
+        let pages = vec![
+            ("gemini://a.test/", doc("Home =>/1 =>/2 =>/3")),
+            ("gemini://a.test/1", doc("One")),
+            ("gemini://a.test/2", doc("Two")),
+            ("gemini://a.test/3", doc("Three")),
+        ];
+        // The file already has the home page and page 1: only 2 and 3 are new.
+        let mut known = Known::default();
+        for (url, body, links) in [
+            (
+                "gemini://a.test/",
+                "Home",
+                vec![
+                    "gemini://a.test/1",
+                    "gemini://a.test/2",
+                    "gemini://a.test/3",
+                ],
+            ),
+            ("gemini://a.test/1", "One", vec![]),
+        ] {
+            known.add(
+                Page {
+                    url: url.into(),
+                    body: body.into(),
+                    links: links.into_iter().map(String::from).collect(),
+                    ..Page::default()
+                },
+                "gemini",
+            );
+        }
+        let (saved, asked) = crawl(pages.clone(), settings(), known, &[]);
+        let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(urls, ["gemini://a.test/2", "gemini://a.test/3"]);
+        assert!(!asked.contains(&"gemini://a.test/".to_string()));
+
+        // At most two pages from a host.
+        let limited = Settings {
+            host_limit: Some(2),
+            ..settings()
+        };
+        let (saved, _) = crawl(pages, limited, Known::default(), &["gemini://a.test/"]);
+        assert_eq!(saved.len(), 2);
+    }
+}

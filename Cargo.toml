@@ -20,6 +20,14 @@ name = "lost"
 path = "src/main.rs"
 required-features = ["cli"]
 
+# The crawler (ARCHITECTURE.md §15): a separate program, never built by
+# default, so LOST itself stays offline. Build it with
+#   cargo build --release --no-default-features --features spider --bin lost-spider
+[[bin]]
+name = "lost-spider"
+path = "src/spider/main.rs"
+required-features = ["spider"]
+
 [features]
 default = ["cli", "server", "gui"]
 # The lost binary: argument parsing, CLI output, local-socket IPC.
@@ -28,6 +36,8 @@ cli = ["dep:terminal_size", "dep:libc", "dep:interprocess", "dep:jiff"]
 server = ["dep:axum", "dep:tokio", "dep:libc"]
 # egui desktop app and tray icon.
 gui = ["cli", "dep:eframe", "dep:rfd", "dep:ksni", "dep:winit", "dep:tray-icon", "dep:windows-sys"]
+# lost-spider. Not in the default set: only the spider goes online.
+spider = ["dep:rustls", "dep:ctrlc", "dep:regex"]
 
 [dependencies]
 blake3 = "1"
@@ -59,6 +69,11 @@ jiff = { version = "0.2", optional = true }
 zstd = "0.14"
 ed25519-dalek = "3"
 getrandom = "0.4"
+# lost-spider only: TLS for Gemini (ring, so no CMake is needed), Ctrl-C,
+# and --blacklist's regular expressions.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+ctrlc = { version = "3.4", optional = true, features = ["termination"] }
+regex = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
