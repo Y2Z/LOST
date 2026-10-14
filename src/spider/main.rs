@@ -7,6 +7,7 @@
 
 mod crawl;
 mod gemini;
+mod gopher;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use lost::urls::Url;
 
 use crate::crawl::{Blacklist, Crawler, Known, Protocol, Settings};
 use crate::gemini::Gemini;
+use crate::gopher::Gopher;
 
 const USAGE: &str = "\
 lost-spider — LOST's crawler. It wanders a network and saves what it finds
@@ -29,10 +31,11 @@ as a .lost file, signed with your ID, for LOST to import.
 
 Usage:
   lost-spider gemini [OPTIONS]    Wander Geminispace
+  lost-spider gopher [OPTIONS]    Wander Gopherspace
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
-                          (default: lost-crawl-data-gemini-DATE-TIME.lost here;
+                          (default: lost-crawl-data-NETWORK-DATE-TIME.lost here;
                           if the file exists, \" (1)\", \" (2)\"… is added)
   -c, --continue          Carry on with the -o file: its pages are kept, links
                           they lead to are crawled, and the file is signed
@@ -109,7 +112,16 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
             };
             crawl(Gemini::new()?, options)
         }
-        other => Err(format!("unknown network \"{other}\" (lost-spider knows: gemini)").into()),
+        "gopher" => {
+            let Some(options) = parse_options(&args[1..], Gopher::SCHEME)? else {
+                print!("{USAGE}");
+                return Ok(ExitCode::SUCCESS);
+            };
+            crawl(Gopher, options)
+        }
+        other => {
+            Err(format!("unknown network \"{other}\" (lost-spider knows: gemini, gopher)").into())
+        }
     }
 }
 

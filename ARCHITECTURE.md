@@ -509,7 +509,8 @@ The common shape every parser produces:
 
 - **Common Crawl WARC files** — the pages as fetched (`…-00000.warc.gz`, several times the size of the WET and WAT made from them). Text, title and links come from the HTML itself, so the WET and WAT aren't needed; the raw responses go to the capture archive (§6.7). A WARC file and its WET and WAT are one import (§8.2).
 - **Gemini** — crawled with `lost-spider gemini` (§15), which saves `.lost` files; dumps from other crawlers later.
-- **Gopher**, **.onion** dumps.
+- **Gopher** — crawled with `lost-spider gopher` (§15.5).
+- **.onion** dumps.
 - **I2P** — the XL-I2P CSV dataset from IEEE DataPort, once obtained.
 - More web dumps as they turn up.
 
@@ -781,7 +782,8 @@ lost/
     └── spider/               lost-spider, its own program   [spider]
         ├── main.rs           command line, the output file, Ctrl-C
         ├── crawl.rs          queue, politeness, robots.txt, blacklist
-        └── gemini.rs         Gemini: TLS, responses, gemtext
+        ├── gemini.rs         Gemini: TLS, responses, gemtext
+        └── gopher.rs         Gopher: selectors, menus
 ```
 
 ### 13.1 Library API (sketch)
@@ -815,7 +817,7 @@ lost.remove_import(import_id)?;
 
 ### Later
 
-- ✅ `lost-spider gemini` (§15). Next: `gopher`, `onion` (through Tor's SOCKS proxy), `i2p` (through I2P's HTTP proxy).
+- ✅ `lost-spider gemini` and `lost-spider gopher` (§15). Next: `onion` (through Tor's SOCKS proxy), `i2p` (through I2P's HTTP proxy).
 - `related:`; link-based ranking.
 - Multiple physical indexes for very large deployments; LAN federation.
 - Mobile apps via UniFFI bindings; Docker image; FreeBSD rc script; Windows service.
@@ -834,15 +836,17 @@ A crawler for the networks LOST can't get dumps of. It saves what it finds as a 
 ### 15.1 Command line
 
 ```
-lost-spider gemini [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander]
-                   [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS] [--host-limit N]
+lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander]
+                    [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS] [--host-limit N]
 ```
+
+`NETWORK` is `gemini` (§15.4) or `gopher` (§15.5); the options are the same for each.
 
 | Option | What it does |
 |---|---|
-| `-o`, `--output PATH` | A `.lost` file, or a folder to put one in. Default name: `lost-crawl-data-gemini-YYYYMMDD-HHMMSS.lost` (UTC), in the current folder. An existing file isn't touched: ` (1)`, ` (2)`… goes before `.lost` |
+| `-o`, `--output PATH` | A `.lost` file, or a folder to put one in. Default name: `lost-crawl-data-NETWORK-YYYYMMDD-HHMMSS.lost` (UTC), in the current folder. An existing file isn't touched: ` (1)`, ` (2)`… goes before `.lost` |
 | `-c`, `--continue` | Carry on with exactly the `-o` file (§9.4, §15.3), whoever signed it; started under that name if it doesn't exist |
-| `--link URL`, `--links FILE` | Crawled first, even if nothing links to them (`example.org` means `gemini://example.org/`). A file has one a line; blank lines and `#` comments are skipped |
+| `--link URL`, `--links FILE` | Crawled first, even if nothing links to them (`example.org` means `gemini://example.org/`, or `gopher://…` for Gopher). A file has one a line; blank lines and `#` comments are skipped |
 | `--dont-wander` | Crawl only the hosts of the `--link` URLs (exactly those hosts and ports, not their subdomains): their links are followed within those hosts, and nowhere else. No seeds. Needs `--link` or `--links` |
 | `--search PHRASE`, `--searches FILE` | Typed into the search boxes found (§15.2) |
 | `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`). Skipped pages aren't saved and their links aren't followed |
@@ -878,6 +882,18 @@ With `-c`, the file's pages are read first: their URLs count as fetched, their t
 - A request is the URL and CRLF; a response, `NN META` and CRLF. 10 s to connect, 15 s for each read or write, 60 s for a whole response; text over 5 MB is cut there. A connection closed without TLS's close_notify ends a response normally (many servers do that).
 - `text/gemini`: the title is the first `#` heading (else the first heading of any level); the body is every line's text without the markup — a `=>` line's text, or its URL if it has none; preformatted blocks as they are; links are the `=>` lines, resolved against the page, plus `gemini://` URLs written in the text. `text/markdown`: the title from the first `# ` line. Other `text/*`: the text as it is. UTF-8, or Latin-1 when the server says so.
 - Seeds: geminiprotocol.net, the known-hosts lists of Kennedy and TLGS, the BBS at bbs.geminispace.org, the Antenna aggregator and mozz.us.
+
+### 15.5 Gopher (`gopher.rs`)
+
+- Plain TCP on port 70, no TLS. A request is the selector and CRLF (for a search, the selector, a tab and the words); the answer is the item, until the server closes the connection. 10 s to connect, 15 s for each read or write, 60 s in all; more than 5 MB is cut there.
+- URLs (RFC 4266): the path is `/`, the item type, then the selector, percent-encoded (`gopher://host/0/notes/a%20b.txt`); a bare host is its main menu. Status lines say `gopherholes`.
+- **Fetched:** text files (type `0`), menus (`1`), search results (`7`, with `--search`), HTML (`h`). **Saved by their link alone:** BinHex, DOS files, uuencoded files, binaries, GIFs, images, PNGs, sounds, video, documents and PDFs (`4 5 6 9 g I p s ; < d P`). **Skipped:** telnet, CSO phone books, mirrors (`+`) and types without an agreed meaning.
+- **Menus** are pages: every line's display text, info lines (`i`) included; links are every item there's something to save from, plus `gopher://` URLs written in info lines. `h` items whose selector is `URL:…` are links to the web: kept in `links`, not crawled. A menu's title is the link's text, else the selector's last part, else the host.
+- **Text files** lose their closing `.` line. **HTML** becomes text as in the web imports, its `<title>` the title.
+- A server's error menu (a first line of type `3`) instead of the item counts as "not found". Text that isn't UTF-8 is read as Latin-1: much of Gopherspace predates UTF-8.
+- **robots.txt** is the text file with the selector `robots.txt` (Veronica-2's convention); its rules are matched against selectors, as `/` and the selector.
+- **Search boxes** (`7`) are searches by definition: one gets the `--search` phrases unless its text or selector says it's for writing something (a guestbook, a comment…).
+- Seeds: gopher.floodgap.com (home of Veronica-2, Gopherspace's search engine) and its list of servers, sdf.org, bitreich.org, tilde.team, gopher.quux.org.
 
 ---
 

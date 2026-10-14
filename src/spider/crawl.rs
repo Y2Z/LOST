@@ -67,6 +67,38 @@ pub trait Protocol: Send + Sync + 'static {
 
     /// The scheme's port.
     fn port(&self) -> u16;
+
+    /// Where a host's robots.txt is.
+    const ROBOTS: &'static str = "/robots.txt";
+
+    /// What robots.txt rules are matched against: the path and query.
+    fn robots_path(url: &Url) -> String {
+        match &url.query {
+            Some(query) => format!("{}?{query}", url.path),
+            None => url.path.clone(),
+        }
+    }
+
+    /// A file that's saved by its link alone, without asking for it.
+    fn is_file(url: &Url) -> bool {
+        url.extension()
+            .is_some_and(|e| FILE_EXTENSIONS.contains(&e.as_str()))
+    }
+
+    /// A title for a page that has none of its own and no link text: the
+    /// file's name, or the host.
+    fn fallback_title(url: &Url) -> String {
+        match url.path.rsplit('/').find(|s| !s.is_empty()) {
+            Some(name) => percent_decode(name),
+            None => url.host.clone(),
+        }
+    }
+
+    /// Whether a box to type into (its prompt, the link's text) is a search
+    /// box the phrases of `--search` may go into.
+    fn is_search(prompt: &str, label: Option<&str>, url: &Url) -> bool {
+        looks_like_search(&format!("{prompt} {}", label.unwrap_or("")), url)
+    }
 }
 
 /// A server's answer, in the terms every protocol shares.
@@ -298,15 +330,11 @@ impl Robots {
         Robots { rules }
     }
 
-    pub fn allows(&self, url: &Url) -> bool {
-        let mut path = url.path.clone();
-        if let Some(query) = &url.query {
-            path.push('?');
-            path.push_str(query);
-        }
+    /// Whether `path` (see [`Protocol::robots_path`]) may be fetched.
+    pub fn allows(&self, path: &str) -> bool {
         let mut best: Option<(usize, bool)> = None;
         for (allow, pattern) in &self.rules {
-            if glob(pattern, &path) {
+            if glob(pattern, path) {
                 let len = pattern.len();
                 if best.is_none_or(|(l, a)| len > l || (len == l && *allow && !a)) {
                     best = Some((len, *allow));
@@ -384,7 +412,8 @@ fn encode_query(text: &str) -> String {
     out
 }
 
-fn percent_decode(text: &str) -> String {
+/// `%XX` escapes decoded; bytes that aren't UTF-8 replaced.
+pub fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -418,8 +447,15 @@ fn looks_like_trap(url: &Url) -> bool {
 /// The prompt of a box to type into looks like it's for searching, not for
 /// posting: guestbooks, comments and replies look the same in Gemini, and
 /// the spider never writes anything anywhere.
-fn looks_like_search(prompt: &str, url: &Url) -> bool {
+pub fn looks_like_search(prompt: &str, url: &Url) -> bool {
     const SEARCH: &[&str] = &["search", "query", "find", "look up", "lookup", "keyword"];
+    let text = format!("{prompt} {}", url.path).to_lowercase();
+    SEARCH.iter().any(|w| text.contains(w)) && !looks_like_posting(&text)
+}
+
+/// Words of boxes for writing something (a comment, a guestbook entry, a
+/// name, a password), which the spider never types into.
+pub fn looks_like_posting(text: &str) -> bool {
     const NOT: &[&str] = &[
         "comment",
         "guestbook",
@@ -438,8 +474,8 @@ fn looks_like_search(prompt: &str, url: &Url) -> bool {
         "captcha",
         "secret",
     ];
-    let text = format!("{prompt} {}", url.path).to_lowercase();
-    SEARCH.iter().any(|w| text.contains(w)) && !NOT.iter().any(|w| text.contains(w))
+    let text = text.to_lowercase();
+    NOT.iter().any(|w| text.contains(w))
 }
 
 /// `host`, or `host:port` for a port that isn't the scheme's; punycode for
@@ -472,15 +508,12 @@ fn seen_key(url: &Url) -> u64 {
     hash(&on_the_wire(url).normalized())
 }
 
-/// A title for a page that has none of its own: the link's text, the file's
-/// name, or the host.
-fn fallback_title(url: &Url, label: Option<&str>) -> String {
-    if let Some(label) = label {
-        return label.to_string();
-    }
-    match url.path.rsplit('/').find(|s| !s.is_empty()) {
-        Some(name) => percent_decode(name),
-        None => url.host.clone(),
+/// A title for a page that has none of its own: the link's text, or what
+/// the protocol makes of the URL.
+fn fallback_title(url: &Url, label: Option<&str>, untitled: fn(&Url) -> String) -> String {
+    match label {
+        Some(label) => label.to_string(),
+        None => untitled(url),
     }
 }
 
@@ -556,10 +589,13 @@ struct Server {
     next: Instant,
 }
 
-#[derive(Default)]
 struct State {
     /// The protocol's.
     scheme: &'static str,
+    robots_url: &'static str,
+    robots_path: fn(&Url) -> String,
+    is_file: fn(&Url) -> bool,
+    untitled: fn(&Url) -> String,
     hosts: HashMap<String, Host>,
     servers: HashMap<IpAddr, Server>,
     /// Servers with something to ask, by when they may be asked.
@@ -665,7 +701,7 @@ impl State {
                 origin.path = "/".into();
                 origin.query = None;
                 let mut robots = origin.clone();
-                robots.path = "/robots.txt".into();
+                robots.path = self.robots_url.into();
                 let saved = self.saved_before.get(&key).copied().unwrap_or(0);
                 let done = settings.host_limit.is_some_and(|limit| saved >= limit);
                 let mut queue = VecDeque::new();
@@ -808,7 +844,8 @@ impl State {
                     server.hosts.push_back(key.clone());
                 }
                 if job.kind != Kind::Robots {
-                    if host.robots.as_ref().is_some_and(|r| !r.allows(&job.url)) {
+                    let path = (self.robots_path)(&job.url);
+                    if host.robots.as_ref().is_some_and(|r| !r.allows(&path)) {
                         continue;
                     }
                     if settings.host_limit.is_some_and(|limit| host.saved >= limit) {
@@ -817,16 +854,16 @@ impl State {
                         host.queue.clear();
                         continue;
                     }
-                    let is_file = job
-                        .url
-                        .extension()
-                        .is_some_and(|e| FILE_EXTENSIONS.contains(&e.as_str()));
-                    if job.kind == Kind::Page && is_file {
+                    if job.kind == Kind::Page && (self.is_file)(&job.url) {
                         host.saved += 1;
                         schedule(server, ip, &mut self.ready, &mut self.order);
                         self.active += 1;
                         return Ok(Next::Task(Box::new(Task::Save(Page {
-                            title: Some(fallback_title(&job.url, job.label.as_deref())),
+                            title: Some(fallback_title(
+                                &job.url,
+                                job.label.as_deref(),
+                                self.untitled,
+                            )),
                             url: job.url.to_string(),
                             sources: vec![self.scheme.to_string()],
                             crawled: Some(lost::store::now()),
@@ -997,10 +1034,21 @@ impl<P: Protocol> Crawler<P> {
     pub fn new(protocol: P, settings: Settings, known: Known, links: &[String]) -> Arc<Crawler<P>> {
         let mut state = State {
             scheme: P::SCHEME,
+            robots_url: P::ROBOTS,
+            robots_path: P::robots_path,
+            is_file: P::is_file,
+            untitled: P::fallback_title,
+            hosts: HashMap::new(),
+            servers: HashMap::new(),
+            ready: BinaryHeap::new(),
+            order: 0,
+            unresolved: VecDeque::new(),
             seen: known.seen,
             contents: known.contents,
             saved_before: known.saved,
-            ..State::default()
+            waiting: 0,
+            active: 0,
+            resolving: 0,
         };
         // With --dont-wander, the links are where to go: no seeds.
         let seeds: &[&str] = match settings.only_hosts {
@@ -1137,9 +1185,9 @@ impl<P: Protocol> Crawler<P> {
                 if job.kind == Kind::Results {
                     return Outcome::Follow(parsed.links);
                 }
-                let title = parsed
-                    .title
-                    .unwrap_or_else(|| fallback_title(&job.url, job.label.as_deref()));
+                let title = parsed.title.unwrap_or_else(|| {
+                    fallback_title(&job.url, job.label.as_deref(), P::fallback_title)
+                });
                 let blocked = self
                     .settings
                     .blacklist
@@ -1162,7 +1210,11 @@ impl<P: Protocol> Crawler<P> {
                 page: Page {
                     url: job.url.to_string(),
                     sources: vec![P::SCHEME.to_string()],
-                    title: Some(fallback_title(&job.url, job.label.as_deref())),
+                    title: Some(fallback_title(
+                        &job.url,
+                        job.label.as_deref(),
+                        P::fallback_title,
+                    )),
                     crawled: Some(lost::store::now()),
                     ..Page::default()
                 },
@@ -1177,7 +1229,7 @@ impl<P: Protocol> Crawler<P> {
             Response::Input { prompt, sensitive } => {
                 if sensitive
                     || self.settings.searches.is_empty()
-                    || !looks_like_search(&prompt, &job.url)
+                    || !P::is_search(&prompt, job.label.as_deref(), &job.url)
                 {
                     return Outcome::Nothing;
                 }
@@ -1211,7 +1263,7 @@ mod tests {
              User-agent: indexer\nUser-agent: researcher\nDisallow: /private/\nAllow: /private/ok\n\n\
              User-agent: *\nDisallow: /cgi-bin/*.cgi$\nDisallow: /search # no searching\nDisallow:\n",
         );
-        let allows = |path: &str| robots.allows(&Url::parse(&format!("gemini://x{path}")).unwrap());
+        let allows = |path: &str| robots.allows(path);
         assert!(allows("/"));
         assert!(allows("/gemlog/"));
         assert!(!allows("/private/diary.gmi"));
@@ -1219,7 +1271,7 @@ mod tests {
         assert!(!allows("/cgi-bin/calc.cgi"));
         assert!(allows("/cgi-bin/calc.cgi/more"));
         assert!(!allows("/search?cats"));
-        assert!(Robots::default().allows(&Url::parse("gemini://x/a").unwrap()));
+        assert!(Robots::default().allows("/a"));
     }
 
     #[test]
@@ -1289,11 +1341,14 @@ mod tests {
             ["gemini://a.b/c.gmi", "gemini://d.e/"]
         );
         assert_eq!(
-            fallback_title(&at("/files/My%20cat.jpg"), None),
+            fallback_title(&at("/files/My%20cat.jpg"), None, Fake::fallback_title),
             "My cat.jpg"
         );
-        assert_eq!(fallback_title(&at("/"), None), "x");
-        assert_eq!(fallback_title(&at("/a"), Some("Link")), "Link");
+        assert_eq!(fallback_title(&at("/"), None, Fake::fallback_title), "x");
+        assert_eq!(
+            fallback_title(&at("/a"), Some("Link"), Fake::fallback_title),
+            "Link"
+        );
         let idn = clean(Url::parse("gemini://Café.example/x").unwrap());
         assert_eq!(idn.host, "café.example");
         assert_eq!(host_key(&idn), "xn--caf-dma.example");
