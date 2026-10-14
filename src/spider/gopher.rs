@@ -36,8 +36,8 @@ const FILE_TYPES: &[char] = &['4', '5', '6', '9', 'g', 'I', 'p', 's', ';', '<', 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// Through a proxy (Tor adds a few seconds a hop).
 pub const PROXIED_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longer items are cut here.
-const MAX_BODY: usize = 5 * 1024 * 1024;
+/// Longer answers are cut here: LOST's limit for a page's text.
+const MAX_BODY: usize = lost::MAX_BODY_BYTES;
 
 pub struct Gopher {
     /// A SOCKS5 proxy (Gopher can't go through an HTTP one).

@@ -300,7 +300,7 @@ When an import brings a page for a URL that already has a document:
 
 The loser is discarded, never archived. On a tie the existing version stays, so importing the same data twice changes nothing — the import reports those pages as duplicates ("already in the database").
 
-**Size limit.** Text is cut at a word boundary beyond `MAX_BODY_BYTES` (4 MiB) per page. It's a constant in the source, not a setting, because it's a performance trade-off rather than a user preference. It can be raised in a future release, or lowered if huge pages slow searches down.
+**Size limit.** Text is cut at a word boundary beyond `MAX_BODY_BYTES` (4 MiB) per page. It's a constant in the source, not a setting, because it's a performance trade-off rather than a user preference — and because it's applied once, when a page comes in: a lower setting couldn't shorten pages already stored, nor a higher one bring back what was cut, and `.lost` files would differ by who made them. `lost-spider` uses the same constant: it stops reading an answer there, and cuts the text there too. It can be raised in a future release, or lowered if huge pages slow searches down.
 
 **Import report.** Every import counts its pages as **new**, **updated** (replaced by a fuller or newer version), **already in the database** (duplicates) and **repeated** within the import itself, and says so when the same file was imported before (recognized by its BLAKE3 hash).
 
@@ -877,7 +877,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 - **Failures:** redirects are followed up to 5 in a row. A failed request (no connection, a TLS failure, a timeout) is tried once more; a host that fails 3 in a row is left alone for the rest of the run, as is one whose name doesn't resolve. "Try later" answers are tried twice more.
 - **Search boxes:** only with `--search`. A box gets each phrase if its prompt or path says search, query, find, keyword… and nothing like comment, post, message, reply, name, mail, password… — a guestbook looks just like a search box, and the spider never writes anything anywhere. Password boxes (Gemini's 11) never. The results pages' links are followed; the pages aren't saved. robots.txt still applies: TLGS, for one, disallows its search page, so it isn't searched.
 - **Files** with a known extension (images, audio, video, archives, PDFs, fonts, …) are saved from the link alone: the URL, the link's text (or the file name) as title, no text, and the server isn't asked. Other responses that aren't text are saved the same way, after reading only the response's first line.
-- **Pages:** `url`, `sources` (the network: `["gemini"]`, `["onion"]`, …), `title` (the page's own, else the link's text, else the file name, else the host), `body`, `links` (all of them, any scheme), `crawled`.
+- **Pages:** a page's text is cut at `MAX_BODY_BYTES` (§6.4), as an import would. A page with no text (an empty file, say) is still saved, with its title, like a file saved by its link. `url`, `sources` (the network: `["gemini"]`, `["onion"]`, …), `title` (the page's own, else the link's text, else the file name, else the host), `body`, `links` (all of them, any scheme), `crawled`.
 
 ### 15.3 Continuing
 
@@ -886,13 +886,13 @@ With `-c`, the file's pages are read first: their URLs count as fetched, their t
 ### 15.4 Gemini (`gemini.rs`)
 
 - TLS 1.2 or 1.3 (rustls with ring), with SNI. Any certificate is accepted: Gemini capsules sign their own, and only public pages are read; the handshake's signatures are still checked.
-- A request is the URL and CRLF; a response, `NN META` and CRLF. Timeouts per `-t` (15 s; 60 s for a whole response); text over 5 MB is cut there. Through a SOCKS5 `--proxy` (only). A connection closed without TLS's close_notify ends a response normally (many servers do that).
+- A request is the URL and CRLF; a response, `NN META` and CRLF. Timeouts per `-t` (15 s; 60 s for a whole response); an answer is read up to `MAX_BODY_BYTES` (4 MiB, §6.4). Through a SOCKS5 `--proxy` (only). A connection closed without TLS's close_notify ends a response normally (many servers do that).
 - `text/gemini`: the title is the first `#` heading (else the first heading of any level); the body is every line's text without the markup — a `=>` line's text, or its URL if it has none; preformatted blocks as they are; links are the `=>` lines, resolved against the page, plus `gemini://` URLs written in the text. `text/markdown`: the title from the first `# ` line. Other `text/*`: the text as it is. UTF-8, or Latin-1 when the server says so.
 - Seeds: geminiprotocol.net, the known-hosts lists of Kennedy and TLGS, the BBS at bbs.geminispace.org, the Antenna aggregator and mozz.us.
 
 ### 15.5 Gopher (`gopher.rs`)
 
-- Plain TCP on port 70, no TLS. A request is the selector and CRLF (for a search, the selector, a tab and the words); the answer is the item, until the server closes the connection. Timeouts per `-t` (10 s; 40 s in all); more than 5 MB is cut there. Through a SOCKS5 `--proxy` (only).
+- Plain TCP on port 70, no TLS. A request is the selector and CRLF (for a search, the selector, a tab and the words); the answer is the item, until the server closes the connection. Timeouts per `-t` (10 s; 40 s in all); an item is read up to `MAX_BODY_BYTES` (4 MiB, §6.4): a server that sends forever is cut off there. Through a SOCKS5 `--proxy` (only).
 - URLs (RFC 4266): the path is `/`, the item type, then the selector, percent-encoded (`gopher://host/0/notes/a%20b.txt`); a bare host is its main menu. Status lines say `gopherholes`.
 - **Fetched:** text files (type `0`), menus (`1`), search results (`7`, with `--search`), HTML (`h`). **Saved by their link alone:** BinHex, DOS files, uuencoded files, binaries, GIFs, images, PNGs, sounds, video, documents and PDFs (`4 5 6 9 g I p s ; < d P`). **Skipped:** telnet, CSO phone books, mirrors (`+`) and types without an agreed meaning.
 - **Menus** are pages: every line's display text, info lines (`i`) included; links are every item there's something to save from, plus `gopher://` URLs written in info lines. `h` items whose selector is `URL:…` are links to the web: kept in `links`, not crawled. A menu's title is the link's text, else the selector's last part, else the host.
@@ -907,7 +907,7 @@ With `-c`, the file's pages are read first: their URLs count as fetched, their t
 Both are ordinary websites reached through a proxy, so they share an HTTP client and the reading of HTML:
 
 - **HTTP/1.1** (`http.rs`): `GET`, `Connection: close`, `Accept-Encoding: gzip`; chunked bodies put back together; `User-Agent: lost-spider/VERSION`. Through a SOCKS5 proxy the request goes down a tunnel; through an HTTP proxy it names the whole URL (`GET http://site.i2p/page HTTP/1.1`). `https://` works over SOCKS5, accepting any certificate (a `.onion` address already proves which server it is), not through an HTTP proxy.
-- **Answers:** 2xx is a document — text (`text/*`, XHTML; `text/html` when the server doesn't say) read up to 5 MB, anything else saved by its link alone without reading it; 301/302/303/307/308 a redirect; 429 and 503 with `Retry-After` a slow-down; other 5xx "try later"; anything else "not found".
+- **Answers:** 2xx is a document — text (`text/*`, XHTML; `text/html` when the server doesn't say) read up to `MAX_BODY_BYTES` (4 MiB), anything else saved by its link alone without reading it; 301/302/303/307/308 a redirect; 429 and 503 with `Retry-After` a slow-down; other 5xx "try later"; anything else "not found".
 - **HTML:** the title from `<title>`, the text from `text::html_to_text` (which leaves out scripts, styles, comments and SVG, and turns blocks into blank lines), the links from `<a href>`, `<area href>`, `<frame src>` and `<iframe src>`, resolved against the page, each with its text, plus `http(s)://` URLs written in the text (lists of sites often are just that). Latin-1 or Windows-1252 when the type or a `<meta>` near the start says so and the bytes aren't UTF-8. Other text: as it is, with `http(s)://` URLs written in it as links.
 - robots.txt, the blacklist, search boxes, `-c`, `--dont-crawl` and the rest work as for the other networks.
 

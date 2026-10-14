@@ -1342,18 +1342,23 @@ impl<P: Protocol> Crawler<P> {
                 let title = parsed.title.unwrap_or_else(|| {
                     fallback_title(&job.url, job.label.as_deref(), P::fallback_title)
                 });
-                let blocked = self
-                    .settings
-                    .blacklist
-                    .blocks_page(Some(&title), &parsed.body);
+                // Decoding can make text longer than the bytes it came as
+                // (Latin-1 to UTF-8): cut to LOST's limit, as an import would.
+                let body = lost::text::truncate_at_word(&parsed.body, lost::MAX_BODY_BYTES);
+                let body = if body.len() < parsed.body.len() {
+                    body.to_string()
+                } else {
+                    parsed.body
+                };
+                let blocked = self.settings.blacklist.blocks_page(Some(&title), &body);
                 Outcome::Page {
-                    content: (!parsed.body.is_empty()).then(|| hash(&parsed.body)),
+                    content: (!body.is_empty()).then(|| hash(&body)),
                     blocked,
                     page: Page {
                         url: job.url.to_string(),
                         sources: vec![P::NAME.to_string()],
                         title: Some(title),
-                        body: parsed.body,
+                        body,
                         links: parsed.links.iter().map(|l| l.url.clone()).collect(),
                         crawled: Some(lost::store::now()),
                     },

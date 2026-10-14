@@ -14,8 +14,8 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use crate::crawl::{Link, Parsed, Response, Route, mentions, port};
 use crate::net::{self, Proxy};
 
-/// Longer bodies are cut here.
-const MAX_BODY: usize = 5 * 1024 * 1024;
+/// Longer answers are cut here: LOST's limit for a page's text.
+const MAX_BODY: usize = lost::MAX_BODY_BYTES;
 /// An error page is read this far (enough to tell a proxy's from a site's).
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const MAX_HEADERS: usize = 64 * 1024;

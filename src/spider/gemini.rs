@@ -31,8 +31,8 @@ const SEEDS: &[&str] = &[
 pub const TIMEOUT: Duration = Duration::from_secs(15);
 /// Through a proxy (Tor adds a few seconds a hop).
 pub const PROXIED_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longer documents are cut here.
-const MAX_BODY: usize = 5 * 1024 * 1024;
+/// Longer answers are cut here: LOST's limit for a page's text.
+const MAX_BODY: usize = lost::MAX_BODY_BYTES;
 /// A status line is at most `NN `, 1024 bytes of meta and CRLF.
 const MAX_HEADER: usize = 1029;
 
