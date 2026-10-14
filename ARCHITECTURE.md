@@ -847,7 +847,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander
 | `-o`, `--output PATH` | A `.lost` file, or a folder to put one in. Default name: `lost-crawl-data-NETWORK-YYYYMMDD-HHMMSS.lost` (UTC), in the current folder. An existing file isn't touched: ` (1)`, ` (2)`… goes before `.lost` |
 | `-c`, `--continue` | Carry on with exactly the `-o` file (§9.4, §15.3), whoever signed it; started under that name if it doesn't exist |
 | `--link URL`, `--links FILE` | Crawled first, even if nothing links to them (`example.org` means `gemini://example.org/`, or `gopher://…` for Gopher). A file has one a line; blank lines and `#` comments are skipped |
-| `--dont-wander` | Crawl only the hosts of the `--link` URLs (exactly those hosts and ports, not their subdomains): their links are followed within those hosts, and nowhere else. No seeds. Needs `--link` or `--links` |
+| `--dont-wander` | Fetch only the `--link` URLs (following their redirects) and none of the links on them: an easy way to add certain pages to a file, and nothing else. No seeds, and with `-c` nothing from the file's pages; a search box among them gets the `--search` phrases, and the results pages are saved. Needs `--link` or `--links` |
 | `--search PHRASE`, `--searches FILE` | Typed into the search boxes found (§15.2) |
 | `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`). Skipped pages aren't saved and their links aren't followed |
 | `--delay SECONDS` | Between two requests to the same server; default 1, decimals allowed |
@@ -855,12 +855,12 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Signed with your ID (§9.2), made if there's none yet; unsigned only if LOST's folder can't be found.
-- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Wandering Geminispace… 1,234 pages saved · 56 capsules · 7,890 links waiting` — `Crawling Geminispace…` with `--dont-wander`, since it only goes where it's sent — redrawn every second on a terminal, a line a minute otherwise.
+- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Wandering Geminispace… 1,234 pages saved · 56 capsules · 7,890 links waiting` — `Scraping Geminispace…` with `--dont-wander`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise.
 - Ctrl-C (or SIGTERM, SIGHUP) stops: requests under way are abandoned, pages already received are written, and the file is finished and signed. A second Ctrl-C quits at once, leaving the file as of its last checkpoint. The last lines say how to continue and how to import.
 
 ### 15.2 Crawling (`crawl.rs`)
 
-- **Start:** the `--link` URLs first, then the network's seeds, then (with `-c`) the links of the file's pages. With `--dont-wander`, no seeds, and only links within the `--link` hosts are followed (with `-c` too).
+- **Start:** the `--link` URLs first, then the network's seeds, then (with `-c`) the links of the file's pages. With `--dont-wander`, only the `--link` URLs (§15.1).
 - **Looking up hosts:** at most half the workers look up host names while there are servers ready to be asked, so a run that starts with thousands of new hosts (as a continued one does) gets to crawling at once.
 - **Politeness:** one request at a time per server *IP address* — a host serving thousands of capsules as subdomains is one server — `--delay` apart; up to 32 requests at once to different servers. A "slow down" answer (Gemini's 44) is waited out before asking again.
 - **robots.txt** is fetched from every host before anything else, every run. The rules of the groups for `*`, `indexer`, `archiver` (Gemini's "virtual user agents") and `lost-spider` apply; the longest matching rule wins (`Allow` on a tie); `*` and a final `$` work as in Google's rules. No robots.txt means everything is allowed.

@@ -108,7 +108,7 @@ LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/) a
 cargo install lost --features spider                # or: make spider
 lost-spider gemini                                  # wander all of Geminispace
 lost-spider gemini --link example.org -o my.lost    # start at a capsule nothing links to
-lost-spider gemini --link example.org --dont-wander # only that capsule
+lost-spider gemini --link example.org --dont-wander # only that page, nothing else
 lost-spider gemini -c -o my.lost                    # carry on where it stopped
 lost-spider gopher                                  # wander all of Gopherspace
 lost -d my.lost                                     # import what it found

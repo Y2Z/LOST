@@ -43,8 +43,8 @@ Options:
       --link URL          Crawl this first, even if nothing links to it
                           (repeat for more)
       --links FILE        The same, one URL a line
-      --dont-wander       Crawl only the hosts of the --link URLs: follow
-                          their links within those hosts, and go nowhere else
+      --dont-wander       Fetch only the --link URLs, and follow none of their
+                          links: to add those pages to a file, and nothing else
       --search PHRASE     Type PHRASE into the search boxes found, and crawl
                           what they find (repeat for more). Only boxes that
                           look like searches; never comment or password boxes
@@ -185,7 +185,7 @@ fn parse_options(args: &[String], scheme: &str) -> lost::Result<Option<Options>>
         }
     }
     if options.dont_wander && options.links.is_empty() {
-        return Err("--dont-wander needs --link or --links: where to crawl".into());
+        return Err("--dont-wander needs --link or --links: the pages to fetch".into());
     }
     if options.continue_ && options.output.is_none() {
         return Err("-c needs the file to carry on with: -c -o FILE.lost".into());
@@ -255,14 +255,7 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
         host_limit: options.host_limit,
         searches: options.searches,
         blacklist,
-        only_hosts: options.dont_wander.then(|| {
-            options
-                .links
-                .iter()
-                .filter_map(|l| Url::parse(l))
-                .map(|u| crawl::host_key(&u))
-                .collect()
-        }),
+        dont_wander: options.dont_wander,
         workers: WORKERS,
     };
     let crawler = Crawler::new(protocol, settings, known, &options.links);
@@ -278,9 +271,9 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     })
     .map_err(|e| format!("can't watch for Ctrl-C: {e}"))?;
 
-    // It goes where it's sent with --dont-wander; otherwise it wanders.
+    // With --dont-wander it only fetches what it's given; otherwise it wanders.
     let verb = if options.dont_wander {
-        "Crawling"
+        "Scraping"
     } else {
         "Wandering"
     };

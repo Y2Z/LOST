@@ -167,8 +167,9 @@ pub struct Settings {
     /// Phrases to type into search boxes.
     pub searches: Vec<String>,
     pub blacklist: Blacklist,
-    /// `--dont-wander`: only these hosts (see [`host_key`]) are crawled.
-    pub only_hosts: Option<HashSet<String>>,
+    /// `--dont-wander`: only the `--link` URLs are fetched (and where they
+    /// redirect); no link on them is followed.
+    pub dont_wander: bool,
     /// Requests running at once (to different servers).
     pub workers: usize,
 }
@@ -683,13 +684,6 @@ impl State {
             return false;
         }
         let key = host_key(&url);
-        if settings
-            .only_hosts
-            .as_ref()
-            .is_some_and(|only| !only.contains(&key))
-        {
-            return false;
-        }
         if !self.seen.insert(seen_key(&url)) {
             return false;
         }
@@ -952,15 +946,17 @@ impl State {
                     if let Some(host) = self.hosts.get_mut(key) {
                         host.saved += 1;
                     }
-                    for link in links {
-                        if let Some(url) = Url::parse(&link.url) {
-                            self.enqueue(url, link.label, Kind::Page, 0, settings);
+                    if !settings.dont_wander {
+                        for link in links {
+                            if let Some(url) = Url::parse(&link.url) {
+                                self.enqueue(url, link.label, Kind::Page, 0, settings);
+                            }
                         }
                     }
                     page_out = Some(page);
                 }
             }
-            Outcome::Follow(links) => {
+            Outcome::Follow(links) if !settings.dont_wander => {
                 for link in links {
                     if let Some(url) = Url::parse(&link.url) {
                         self.enqueue(url, link.label, Kind::Page, 0, settings);
@@ -973,10 +969,18 @@ impl State {
                 }
             }
             Outcome::Search(urls) => {
+                // Not wandering, a search's results are what was asked for:
+                // saved, not followed.
+                let kind = if settings.dont_wander {
+                    Kind::Page
+                } else {
+                    Kind::Results
+                };
                 for url in urls {
-                    self.enqueue(url, None, Kind::Results, 0, settings);
+                    self.enqueue(url, None, kind, 0, settings);
                 }
             }
+            Outcome::Follow(_) => {}
             Outcome::SlowDown(wait) => {
                 next = now + wait.max(settings.delay);
                 if job.tries < 3 {
@@ -1050,10 +1054,17 @@ impl<P: Protocol> Crawler<P> {
             active: 0,
             resolving: 0,
         };
-        // With --dont-wander, the links are where to go: no seeds.
-        let seeds: &[&str] = match settings.only_hosts {
-            Some(_) => &[],
-            None => protocol.seeds(),
+        // With --dont-wander, the links are all there is to fetch: no seeds,
+        // and nothing from the file's pages.
+        let seeds: &[&str] = if settings.dont_wander {
+            &[]
+        } else {
+            protocol.seeds()
+        };
+        let known_links: &[String] = if settings.dont_wander {
+            &[]
+        } else {
+            &known.links
         };
         let start = links
             .iter()
@@ -1062,7 +1073,7 @@ impl<P: Protocol> Crawler<P> {
             // Newest first: links from the file's last pages are where the
             // crawl stopped. Older ones still not crawled are mostly ones
             // that failed before (dead hosts, errors), so they come last.
-            .chain(known.links.iter().rev().map(String::as_str));
+            .chain(known_links.iter().rev().map(String::as_str));
         for link in start {
             if let Some(url) = Url::parse(link) {
                 state.enqueue(url, None, Kind::Page, 0, &settings);
@@ -1447,7 +1458,7 @@ mod tests {
             host_limit: None,
             searches: Vec::new(),
             blacklist: Blacklist::default(),
-            only_hosts: None,
+            dont_wander: false,
             workers: 4,
         }
     }
@@ -1584,21 +1595,42 @@ mod tests {
             ("gemini://c.test/", doc("C")),
         ];
         let only = Settings {
-            only_hosts: Some(["a.test".to_string(), "b.test".to_string()].into()),
+            dont_wander: true,
+            searches: vec!["cats".into()],
             ..settings()
         };
-        let (saved, asked) = crawl(pages, only, Known::default(), &["gemini://a.test/"]);
+        let mut pages = pages;
+        pages.push(("gemini://b.test/old", Response::Redirect("/2".into())));
+        pages.push((
+            "gemini://c.test/find",
+            Response::Input {
+                prompt: "Search".into(),
+                sensitive: false,
+            },
+        ));
+        pages.push(("gemini://c.test/find?cats", doc("Results =>/cat")));
+        let links = [
+            "gemini://a.test/",
+            "gemini://b.test/old",
+            "gemini://c.test/find",
+        ];
+        let (saved, asked) = crawl(pages, only, Known::default(), &links);
         let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
         assert_eq!(
             urls,
             [
                 "gemini://a.test/",
-                "gemini://a.test/1",
-                "gemini://b.test/",
-                "gemini://b.test/2"
+                "gemini://b.test/2",
+                "gemini://c.test/find?cats"
             ]
         );
-        assert!(!asked.iter().any(|u| u.contains("c.test")));
+        // Only those links, where one redirects, and the search's results;
+        // nothing they link to.
+        assert!(
+            !asked
+                .iter()
+                .any(|u| u.ends_with("/1") || u.ends_with("/cat") || *u == "gemini://b.test/")
+        );
     }
 
     #[test]
