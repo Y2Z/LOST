@@ -207,7 +207,7 @@ Planned dependencies (to be added as each part is implemented):
 | IPC | standard library Unix sockets; `interprocess` for named pipes on Windows |
 | Server | `axum`, `tokio`; `libc` for `-b` on Unix |
 | GUI | `eframe` (egui), `rfd` (file picker); tray: `ksni` on Linux/BSD (D-Bus StatusNotifierItem, no GTK), `tray-icon` on Windows/macOS |
-| Spider | `rustls` (with `ring`: no CMake needed) for Gemini's TLS, `ctrlc`, `regex` (`--blacklist`) |
+| Spider | `rustls` (with `ring`: no CMake needed) for TLS, `ctrlc`, `regex` (`--blacklist`); `flate2` (already the library's) for gzipped HTTP. HTTP and SOCKS5 are its own (`http.rs`, `net.rs`): `ureq` was considered, but it only tunnels through HTTP proxies (CONNECT), while I2P's HTTP proxy is meant to be sent whole requests |
 
 ### 5.1 Platforms
 
@@ -510,7 +510,7 @@ The common shape every parser produces:
 - **Common Crawl WARC files** — the pages as fetched (`…-00000.warc.gz`, several times the size of the WET and WAT made from them). Text, title and links come from the HTML itself, so the WET and WAT aren't needed; the raw responses go to the capture archive (§6.7). A WARC file and its WET and WAT are one import (§8.2).
 - **Gemini** — crawled with `lost-spider gemini` (§15), which saves `.lost` files; dumps from other crawlers later.
 - **Gopher** — crawled with `lost-spider gopher` (§15.5).
-- **.onion** dumps.
+- **.onion** and **I2P** sites — crawled with `lost-spider onion` and `lost-spider i2p` (§15.6); dumps later.
 - **I2P** — the XL-I2P CSV dataset from IEEE DataPort, once obtained.
 - More web dumps as they turn up.
 
@@ -782,8 +782,12 @@ lost/
     └── spider/               lost-spider, its own program   [spider]
         ├── main.rs           command line, the output file, Ctrl-C
         ├── crawl.rs          queue, politeness, robots.txt, blacklist
+        ├── net.rs            connecting: straight, SOCKS5, HTTP proxies; TLS
+        ├── http.rs           HTTP/1.1 and HTML, for the web networks
         ├── gemini.rs         Gemini: TLS, responses, gemtext
-        └── gopher.rs         Gopher: selectors, menus
+        ├── gopher.rs         Gopher: selectors, menus
+        ├── onion.rs          .onion sites through Tor; Ahmia's banned list
+        └── i2p.rs            I2P sites through a router; address books
 ```
 
 ### 13.1 Library API (sketch)
@@ -817,7 +821,7 @@ lost.remove_import(import_id)?;
 
 ### Later
 
-- ✅ `lost-spider gemini` and `lost-spider gopher` (§15). Next: `onion` (through Tor's SOCKS proxy), `i2p` (through I2P's HTTP proxy).
+- ✅ `lost-spider gemini`, `gopher`, `onion` and `i2p` (§15).
 - `related:`; link-based ranking.
 - Multiple physical indexes for very large deployments; LAN federation.
 - Mobile apps via UniFFI bindings; Docker image; FreeBSD rc script; Windows service.
@@ -837,10 +841,11 @@ A crawler for the networks LOST can't get dumps of. It saves what it finds as a 
 
 ```
 lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander]
-                    [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS] [--host-limit N]
+                    [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS]
+                    [--host-limit N] [--proxy URL] [-t SECONDS]
 ```
 
-`NETWORK` is `gemini` (§15.4) or `gopher` (§15.5); the options are the same for each.
+`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` (§15.6) or `i2p` (§15.7); the options are the same for each.
 
 | Option | What it does |
 |---|---|
@@ -852,6 +857,8 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander
 | `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`). Skipped pages aren't saved and their links aren't followed |
 | `--delay SECONDS` | Between two requests to the same server; default 1, decimals allowed |
 | `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
+| `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
+| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Signed with your ID (§9.2), made if there's none yet; unsigned only if LOST's folder can't be found.
@@ -862,7 +869,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander
 
 - **Start:** the `--link` URLs first, then the network's seeds, then (with `-c`) the links of the file's pages. With `--dont-wander`, only the `--link` URLs (§15.1).
 - **Looking up hosts:** at most half the workers look up host names while there are servers ready to be asked, so a run that starts with thousands of new hosts (as a continued one does) gets to crawling at once.
-- **Politeness:** one request at a time per server *IP address* — a host serving thousands of capsules as subdomains is one server — `--delay` apart; up to 32 requests at once to different servers. A "slow down" answer (Gemini's 44) is waited out before asking again.
+- **Politeness:** one request at a time per server *IP address* — a host serving thousands of capsules as subdomains is one server — `--delay` apart; up to 32 requests at once to different servers. Through a proxy nothing is looked up, and every host is a server of its own. A "slow down" answer (Gemini's 44) is waited out before asking again.
 - **robots.txt** is fetched from every host before anything else, every run. The rules of the groups for `*`, `indexer`, `archiver` (Gemini's "virtual user agents") and `lost-spider` apply; the longest matching rule wins (`Allow` on a tie); `*` and a final `$` work as in Google's rules. No robots.txt means everything is allowed.
 - **Internationalized host names** (`café.example`) are kept as written, lowercased, in the saved pages, and sent in punycode (`xn--caf-dma.example`: looked up, in TLS's SNI, in the request); both spellings are the same host for politeness, robots.txt, `--dont-wander`, `--host-limit` and `--blacklist`. The conversion is `urls::ascii_host`: RFC 3492, without IDNA's Unicode mapping tables.
 - **Once each:** URLs that normalize alike (§6.5) are fetched once a run. A page with the same text as one saved already isn't saved, nor its links followed.
@@ -870,7 +877,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-wander
 - **Failures:** redirects are followed up to 5 in a row. A failed request (no connection, a TLS failure, a timeout) is tried once more; a host that fails 3 in a row is left alone for the rest of the run, as is one whose name doesn't resolve. "Try later" answers are tried twice more.
 - **Search boxes:** only with `--search`. A box gets each phrase if its prompt or path says search, query, find, keyword… and nothing like comment, post, message, reply, name, mail, password… — a guestbook looks just like a search box, and the spider never writes anything anywhere. Password boxes (Gemini's 11) never. The results pages' links are followed; the pages aren't saved. robots.txt still applies: TLGS, for one, disallows its search page, so it isn't searched.
 - **Files** with a known extension (images, audio, video, archives, PDFs, fonts, …) are saved from the link alone: the URL, the link's text (or the file name) as title, no text, and the server isn't asked. Other responses that aren't text are saved the same way, after reading only the response's first line.
-- **Pages:** `url`, `sources` (`["gemini"]`), `title` (the page's own, else the link's text, else the file name, else the host), `body`, `links` (all of them, any scheme), `crawled`.
+- **Pages:** `url`, `sources` (the network: `["gemini"]`, `["onion"]`, …), `title` (the page's own, else the link's text, else the file name, else the host), `body`, `links` (all of them, any scheme), `crawled`.
 
 ### 15.3 Continuing
 
@@ -879,13 +886,13 @@ With `-c`, the file's pages are read first: their URLs count as fetched, their t
 ### 15.4 Gemini (`gemini.rs`)
 
 - TLS 1.2 or 1.3 (rustls with ring), with SNI. Any certificate is accepted: Gemini capsules sign their own, and only public pages are read; the handshake's signatures are still checked.
-- A request is the URL and CRLF; a response, `NN META` and CRLF. 10 s to connect, 15 s for each read or write, 60 s for a whole response; text over 5 MB is cut there. A connection closed without TLS's close_notify ends a response normally (many servers do that).
+- A request is the URL and CRLF; a response, `NN META` and CRLF. Timeouts per `-t` (15 s; 60 s for a whole response); text over 5 MB is cut there. Through a SOCKS5 `--proxy` (only). A connection closed without TLS's close_notify ends a response normally (many servers do that).
 - `text/gemini`: the title is the first `#` heading (else the first heading of any level); the body is every line's text without the markup — a `=>` line's text, or its URL if it has none; preformatted blocks as they are; links are the `=>` lines, resolved against the page, plus `gemini://` URLs written in the text. `text/markdown`: the title from the first `# ` line. Other `text/*`: the text as it is. UTF-8, or Latin-1 when the server says so.
 - Seeds: geminiprotocol.net, the known-hosts lists of Kennedy and TLGS, the BBS at bbs.geminispace.org, the Antenna aggregator and mozz.us.
 
 ### 15.5 Gopher (`gopher.rs`)
 
-- Plain TCP on port 70, no TLS. A request is the selector and CRLF (for a search, the selector, a tab and the words); the answer is the item, until the server closes the connection. 10 s to connect, 15 s for each read or write, 60 s in all; more than 5 MB is cut there.
+- Plain TCP on port 70, no TLS. A request is the selector and CRLF (for a search, the selector, a tab and the words); the answer is the item, until the server closes the connection. Timeouts per `-t` (10 s; 40 s in all); more than 5 MB is cut there. Through a SOCKS5 `--proxy` (only).
 - URLs (RFC 4266): the path is `/`, the item type, then the selector, percent-encoded (`gopher://host/0/notes/a%20b.txt`); a bare host is its main menu. Status lines say `gopherholes`.
 - **Fetched:** text files (type `0`), menus (`1`), search results (`7`, with `--search`), HTML (`h`). **Saved by their link alone:** BinHex, DOS files, uuencoded files, binaries, GIFs, images, PNGs, sounds, video, documents and PDFs (`4 5 6 9 g I p s ; < d P`). **Skipped:** telnet, CSO phone books, mirrors (`+`) and types without an agreed meaning.
 - **Menus** are pages: every line's display text, info lines (`i`) included; links are every item there's something to save from, plus `gopher://` URLs written in info lines. `h` items whose selector is `URL:…` are links to the web: kept in `links`, not crawled. A menu's title is the link's text, else the selector's last part, else the host.
@@ -894,6 +901,34 @@ With `-c`, the file's pages are read first: their URLs count as fetched, their t
 - **robots.txt** is the text file with the selector `robots.txt` (Veronica-2's convention); its rules are matched against selectors, as `/` and the selector.
 - **Search boxes** (`7`) are searches by definition: one gets the `--search` phrases unless its text or selector says it's for writing something (a guestbook, a comment…).
 - Seeds: gopher.floodgap.com (home of Veronica-2, Gopherspace's search engine) and its list of servers, sdf.org, bitreich.org, tilde.team, gopher.quux.org.
+
+### 15.6 The web through Tor and I2P (`http.rs`, `onion.rs`, `i2p.rs`)
+
+Both are ordinary websites reached through a proxy, so they share an HTTP client and the reading of HTML:
+
+- **HTTP/1.1** (`http.rs`): `GET`, `Connection: close`, `Accept-Encoding: gzip`; chunked bodies put back together; `User-Agent: lost-spider/VERSION`. Through a SOCKS5 proxy the request goes down a tunnel; through an HTTP proxy it names the whole URL (`GET http://site.i2p/page HTTP/1.1`). `https://` works over SOCKS5, accepting any certificate (a `.onion` address already proves which server it is), not through an HTTP proxy.
+- **Answers:** 2xx is a document — text (`text/*`, XHTML; `text/html` when the server doesn't say) read up to 5 MB, anything else saved by its link alone without reading it; 301/302/303/307/308 a redirect; 429 and 503 with `Retry-After` a slow-down; other 5xx "try later"; anything else "not found".
+- **HTML:** the title from `<title>`, the text from `text::html_to_text` (which leaves out scripts, styles, comments and SVG, and turns blocks into blank lines), the links from `<a href>`, `<area href>`, `<frame src>` and `<iframe src>`, resolved against the page, each with its text, plus `http(s)://` URLs written in the text (lists of sites often are just that). Latin-1 or Windows-1252 when the type or a `<meta>` near the start says so and the bytes aren't UTF-8. Other text: as it is, with `http(s)://` URLs written in it as links.
+- robots.txt, the blacklist, search boxes, `-c`, `--dont-wander` and the rest work as for the other networks.
+
+**`.onion`** (`lost-spider onion`):
+
+- Through Tor's SOCKS5 proxy (`socks5://127.0.0.1:9050` unless `--proxy` says otherwise; an HTTP proxy is refused). Tor resolves the names. Only v3 addresses (56 base32 letters and digits, subdomains allowed) are crawled: the older ones were switched off in 2021.
+- **Ahmia's list of banned sites, first.** Ahmia, the onion search engine, publishes the onion sites it bans for child abuse material, as MD5 hashes of their names (`/blacklist/banned/` on its onion site). The spider fetches it through Tor before crawling — saying "Waiting for Tor to connect…" and trying every 10 seconds for up to 5 minutes, since Tor reaches nothing until it has connected to the network — adds it to the blacklist (`Blacklist::ban_hashed`; a site is its last two labels, `name.onion`), and doesn't start without it. Images and other files are never downloaded on any network — saved by their link alone — so what's saved is text.
+- Seeds: Ahmia's onion site and its list of the onion sites it knows (`/onions/`; robots.txt keeps crawlers out of `/address/`, the same list as a page).
+- Default timeout 60 s.
+
+**I2P** (`lost-spider i2p`):
+
+- Through an I2P router: its HTTP proxy (`http://127.0.0.1:4444` unless `--proxy` says otherwise), or i2pd's SOCKS5 proxy. Only `http://` on `.i2p` hosts is crawled.
+- **Its own address book.** A router finds `.i2p` names in its address book, which one that has just started hasn't downloaded yet (i2pd fetches it a few minutes in), so every name would fail. Instead, every address book the spider reads (`name.i2p=destination` lines) tells it where each site is: its `.b32.i2p` address is the base32 of the SHA-256 of the destination's bytes (I2P's base64, `-~` for `+/`), which the router reaches without any name. Sites are asked for by that address and saved under their names; names from nowhere else go to the router as they are.
+- **Waiting for the router:** before crawling, the spider asks for the first seed (i2pd's address book, by `.b32.i2p` address) until it comes, up to 10 minutes, saying it's waiting — a router reaches nothing until it has built tunnels.
+- The router answers for sites it can't reach, with pages of its own: a 5xx, or a 4xx page that talks about its address book or jump services, counts as the site being unreachable (§15.2's failures), not as one of its pages.
+- **Address books:** a text file that's mostly `name.i2p=destination` lines (an I2P `hosts.txt`) isn't saved; each name in it becomes a site to crawl (`http://name.i2p/`).
+- Seeds: the address books routers start with, by `.b32.i2p` address — i2pd's (`addressbook.defaulturl` in its source) and Java I2P's (the I2P project's) — then those i2pd's sample configuration subscribes to (reg.i2p, identiguy.i2p, stats.i2p's new hosts), notbob.i2p's list of sites that are up, and the I2P project's site. More with `--links`.
+- Default timeout 120 s: a site reached for the first time can take a minute or more while the router builds tunnels.
+
+Darknets in particular host material no one wants in a dataset: `--blacklist`'s `title:/…/` and `body:/…/` rules keep pages out by what they say, and their links aren't followed.
 
 ---
 

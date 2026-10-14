@@ -70,9 +70,7 @@ LOST searches through whatever datasets you import.  It comes out of the box wit
 - Common Crawl (WET and WAT files)
 - Hacker News (BigQuery CSV export)
 - `.lost` files — LOST's own format
-- Gemini and Gopher — crawled with `lost-spider` (see [below](#gemini-and-gopher))
-
-<!-- More soon to come: .onion, I2P. -->
+- Gemini, Gopher, `.onion` and I2P — crawled with `lost-spider` (see [below](#crawling-gemini-gopher-onion-and-i2p))
 
 
 ### Datasets
@@ -100,9 +98,9 @@ SELECT * FROM `bigquery-public-data.hacker_news.full` WHERE timestamp >= '2026-0
 
 LOST is capable of importing and exporting `.lost` dataset files, which makes it possible to freely and safely exchange crawl data with other LOST users.  They can be optionally signed, to ensure that your database doesn't get corrupted or spammed.  Both exports and imports can be made either via CLI (see [Usage](#working-with-datasets)) or GUI (Settings → Data).
 
-#### Gemini and Gopher
+#### Crawling: Gemini, Gopher, .onion and I2P
 
-LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/) and Gopherspace there's `lost-spider`, a separate crawler that isn't built or installed by default:
+LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/), Gopherspace, `.onion` sites and I2P sites there's `lost-spider`, a separate crawler that isn't built or installed by default:
 
 ```console
 cargo install lost --features spider                # or: make spider
@@ -111,10 +109,15 @@ lost-spider gemini --link example.org -o my.lost    # start at a capsule nothing
 lost-spider gemini --link example.org --dont-wander # only that page, nothing else
 lost-spider gemini -c -o my.lost                    # carry on where it stopped
 lost-spider gopher                                  # wander all of Gopherspace
+lost-spider onion                                   # .onion sites, through Tor (127.0.0.1:9050)
+lost-spider i2p                                     # I2P sites, through an I2P router (127.0.0.1:4444)
+lost-spider gemini --proxy socks5://127.0.0.1:9050  # Gemini through Tor
 lost -d my.lost                                     # import what it found
 ```
 
-It obeys robots.txt, asks each server for one thing a second (`--delay`), and saves everything into one `.lost` file signed with your ID.  The file is complete even if you stop it with Ctrl-C.  See `lost-spider --help` for search boxes, blacklists and limits.
+It obeys robots.txt, asks each server for one thing a second (`--delay`), and saves everything into one `.lost` file signed with your ID.  The file is complete even if you stop it with Ctrl-C.  See `lost-spider --help` for search boxes, blacklists, proxies and limits.
+
+`onion` needs [Tor](https://www.torproject.org/) running, and `i2p` an I2P router ([i2pd](https://i2pd.website/) or [Java I2P](https://geti2p.net/)).  I2P is slow: reaching a site for the first time can take a minute or more, so its timeout is 120 seconds by default (`-t` changes it, for any network), and on a router (or Tor) that has just started, `lost-spider` waits a few minutes until it can reach sites.  Images and other files are never downloaded, only their links.  Before crawling `.onion` sites, `lost-spider` gets [Ahmia](https://ahmia.fi/)'s list of onion sites banned for child abuse material and skips them; it won't start without that list.  Darknets host all sorts of things, so it's worth keeping a `--blacklist` with `title:/…/` and `body:/…/` rules for what you don't want in your dataset.
 
 
 ### Database

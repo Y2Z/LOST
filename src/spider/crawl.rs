@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use lost::lostfile::Page;
 use lost::urls::Url;
 
+pub use crate::net::Route;
+
 /// Requests can't be longer (Gemini's limit; a sane one for the others).
 const MAX_URL: usize = 1024;
 /// Redirects followed in a row.
@@ -42,7 +44,10 @@ const FILE_EXTENSIONS: &[&str] = &[
 
 /// One network the spider can wander.
 pub trait Protocol: Send + Sync + 'static {
-    /// The URL scheme, which is also the pages' source: `gemini`.
+    /// The network's name, as `lost-spider NAME` takes it; also the pages'
+    /// source, and part of the file's default name: `gemini`.
+    const NAME: &'static str;
+    /// The scheme a bare `--link example.org` gets: `gemini`.
     const SCHEME: &'static str;
     /// The network's name, for "Wandering …": `Geminispace`.
     const SPACE: &'static str;
@@ -52,21 +57,38 @@ pub trait Protocol: Send + Sync + 'static {
     /// Where a crawl starts, besides `--link`.
     fn seeds(&self) -> &'static [&'static str];
 
-    /// Asks `addr` for `url`. `Err` when the server can't be reached or
-    /// stops answering.
-    fn fetch(&self, addr: SocketAddr, url: &Url) -> Result<Response, String>;
+    /// Asks the server (at `route`) for `url`. `Err` when the server can't
+    /// be reached or stops answering.
+    fn fetch(&self, route: Route, url: &Url) -> Result<Response, String>;
 
     /// A text document as a page.
     fn parse(&self, url: &Url, mime: &str, body: &[u8]) -> Parsed;
 
-    /// The server's address.
-    fn resolve(&self, url: &Url, port: u16) -> Option<SocketAddr> {
-        let host = url.host.trim_start_matches('[').trim_end_matches(']');
-        (host, port).to_socket_addrs().ok()?.next()
+    /// The proxy requests go through, if any (`--proxy`).
+    fn proxy(&self) -> Option<&crate::net::Proxy>;
+
+    /// Whether requests go through a proxy. Host names are then never
+    /// looked up here, and each host counts as a server of its own.
+    fn proxied(&self) -> bool {
+        self.proxy().is_some()
     }
 
-    /// The scheme's port.
-    fn port(&self) -> u16;
+    /// Anything to do before crawling, such as fetching a list of sites to
+    /// skip (`.onion`).
+    fn prepare(&self, _blacklist: &mut Blacklist) -> lost::Result<()> {
+        Ok(())
+    }
+
+    /// The server's address, when not proxied.
+    fn resolve(&self, url: &Url) -> Option<SocketAddr> {
+        let host = url.host.trim_start_matches('[').trim_end_matches(']');
+        (host, port(url)).to_socket_addrs().ok()?.next()
+    }
+
+    /// URLs of this network: by default, those with its scheme.
+    fn accepts(url: &Url) -> bool {
+        url.scheme == Self::SCHEME
+    }
 
     /// Where a host's robots.txt is.
     const ROBOTS: &'static str = "/robots.txt";
@@ -124,6 +146,9 @@ pub struct Parsed {
     pub title: Option<String>,
     pub body: String,
     pub links: Vec<Link>,
+    /// A list of addresses (an I2P hosts.txt): its links are followed, the
+    /// page isn't saved.
+    pub skip: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +157,16 @@ pub struct Link {
     pub url: String,
     /// The link's text, if it has one.
     pub label: Option<String>,
+}
+
+/// A URL's port: its own, or its scheme's.
+pub fn port(url: &Url) -> u16 {
+    url.port.unwrap_or(match url.scheme.as_str() {
+        "gemini" => 1965,
+        "gopher" => 70,
+        "https" => 443,
+        _ => 80,
+    })
 }
 
 /// `scheme://` URLs written in text, as links without labels; punctuation
@@ -193,9 +228,25 @@ pub struct Blacklist {
     urls: Vec<regex::Regex>,
     titles: Vec<regex::Regex>,
     bodies: Vec<regex::Regex>,
+    /// Sites known only by the MD5 of their name (`example.onion`), as
+    /// Ahmia lists the onion sites it bans.
+    hashed: HashSet<[u8; 16]>,
 }
 
 impl Blacklist {
+    /// Skips the sites whose names (the last two labels: `xyz.onion`) have
+    /// these MD5 hashes, hex.
+    pub fn ban_hashed(&mut self, hashes: impl IntoIterator<Item = String>) -> usize {
+        let before = self.hashed.len();
+        for hex in hashes {
+            if let Some(hash) = lost::lostfile::from_hex(hex.trim()).and_then(|b| b.try_into().ok())
+            {
+                self.hashed.insert(hash);
+            }
+        }
+        self.hashed.len() - before
+    }
+
     pub fn load(path: &Path) -> lost::Result<Blacklist> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("can't read {}: {e}", path.display()))?;
@@ -246,6 +297,17 @@ impl Blacklist {
 
     fn blocks_url(&self, url: &Url, text: &str) -> bool {
         let ascii = lost::urls::ascii_host(&url.host);
+        if !self.hashed.is_empty() {
+            let host = ascii.as_deref().unwrap_or(&url.host);
+            let labels: Vec<&str> = host.rsplitn(3, '.').collect();
+            let site = match labels.as_slice() {
+                [tld, name, ..] => format!("{name}.{tld}"),
+                _ => host.to_string(),
+            };
+            if self.hashed.contains(&md5(site.as_bytes())) {
+                return true;
+            }
+        }
         for name in [Some(url.host.as_str()), ascii.as_deref()]
             .into_iter()
             .flatten()
@@ -288,6 +350,55 @@ fn without_comment(line: &str) -> &str {
         Some(i) => &line[..i],
         None => line,
     }
+}
+
+/// MD5 (RFC 1321): only to match lists published as MD5 hashes.
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: Vec<u32> = (0..64)
+        .map(|i| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32)
+        .collect();
+    let mut message = data.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_le_bytes());
+    let (mut a0, mut b0, mut c0, mut d0) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    for block in message.chunks(64) {
+        let m: Vec<u32> = block
+            .chunks(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    for (i, word) in [a0, b0, c0, d0].iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 // ── robots.txt ──────────────────────────────────────────────────────────
@@ -531,7 +642,8 @@ pub struct Known {
 }
 
 impl Known {
-    pub fn add(&mut self, page: Page, scheme: &str) {
+    /// A page of the file; `accepts` says which URLs are the network's.
+    pub fn add(&mut self, page: Page, accepts: fn(&Url) -> bool) {
         let Some(url) = Url::parse(&page.url) else {
             return;
         };
@@ -539,7 +651,7 @@ impl Known {
         if !page.body.is_empty() {
             self.contents.insert(hash(&page.body));
         }
-        if url.scheme == scheme {
+        if accepts(&url) {
             *self.saved.entry(host_key(&url)).or_default() += 1;
         }
         self.links.extend(page.links);
@@ -572,7 +684,10 @@ struct Host {
     origin: Url,
     queue: VecDeque<Job>,
     robots: Option<Robots>,
-    addr: Option<SocketAddr>,
+    /// How it's reached, once known.
+    route: Option<Route>,
+    /// Its server's key: the IP address, or the host itself when proxied.
+    server: String,
     /// In its server's round of hosts.
     listed: bool,
     failures: u8,
@@ -581,7 +696,8 @@ struct Host {
     saved: u64,
 }
 
-/// One IP address: one request at a time, `delay` apart.
+/// One IP address (or, through a proxy, one host): one request at a time,
+/// `delay` apart.
 struct Server {
     hosts: VecDeque<String>,
     busy: bool,
@@ -592,15 +708,17 @@ struct Server {
 
 struct State {
     /// The protocol's.
-    scheme: &'static str,
+    name: &'static str,
+    accepts: fn(&Url) -> bool,
+    proxied: bool,
     robots_url: &'static str,
     robots_path: fn(&Url) -> String,
     is_file: fn(&Url) -> bool,
     untitled: fn(&Url) -> String,
     hosts: HashMap<String, Host>,
-    servers: HashMap<IpAddr, Server>,
+    servers: HashMap<String, Server>,
     /// Servers with something to ask, by when they may be asked.
-    ready: BinaryHeap<Reverse<(Instant, u64, IpAddr)>>,
+    ready: BinaryHeap<Reverse<(Instant, u64, String)>>,
     order: u64,
     unresolved: VecDeque<String>,
     seen: HashSet<u64>,
@@ -619,9 +737,9 @@ enum Task {
     /// A file saved by its link alone.
     Save(Page),
     Fetch {
-        ip: IpAddr,
+        server: String,
         key: String,
-        addr: SocketAddr,
+        route: Route,
         job: Job,
     },
 }
@@ -652,14 +770,23 @@ enum Outcome {
 
 fn schedule(
     server: &mut Server,
-    ip: IpAddr,
-    ready: &mut BinaryHeap<Reverse<(Instant, u64, IpAddr)>>,
+    name: &str,
+    ready: &mut BinaryHeap<Reverse<(Instant, u64, String)>>,
     order: &mut u64,
 ) {
     if !server.busy && !server.scheduled && !server.hosts.is_empty() {
         *order += 1;
-        ready.push(Reverse((server.next, *order, ip)));
+        ready.push(Reverse((server.next, *order, name.to_string())));
         server.scheduled = true;
+    }
+}
+
+fn new_server() -> Server {
+    Server {
+        hosts: VecDeque::new(),
+        busy: false,
+        scheduled: false,
+        next: Instant::now(),
     }
 }
 
@@ -672,7 +799,7 @@ impl State {
         hops: u8,
         settings: &Settings,
     ) -> bool {
-        if url.scheme != self.scheme || lost::urls::ascii_host(&url.host).is_none() {
+        if !(self.accepts)(&url) || lost::urls::ascii_host(&url.host).is_none() {
             return false;
         }
         let url = clean(url);
@@ -699,6 +826,14 @@ impl State {
                 let saved = self.saved_before.get(&key).copied().unwrap_or(0);
                 let done = settings.host_limit.is_some_and(|limit| saved >= limit);
                 let mut queue = VecDeque::new();
+                // Through a proxy, nothing is looked up: the host is its
+                // own server.
+                let (route, server) = if self.proxied {
+                    self.servers.entry(key.clone()).or_insert_with(new_server);
+                    (Some(Route::Proxied), key.clone())
+                } else {
+                    (None, String::new())
+                };
                 if !done {
                     queue.push_back(Job {
                         url: robots,
@@ -707,14 +842,17 @@ impl State {
                         tries: 0,
                         hops: 0,
                     });
-                    self.unresolved.push_back(key.clone());
+                    if route.is_none() {
+                        self.unresolved.push_back(key.clone());
+                    }
                     self.waiting += 1;
                 }
                 e.insert(Host {
                     origin,
                     queue,
                     robots: None,
-                    addr: None,
+                    route,
+                    server,
                     listed: false,
                     failures: 0,
                     done,
@@ -733,16 +871,14 @@ impl State {
             hops,
         });
         self.waiting += 1;
-        if let Some(addr) = host.addr
-            && !host.listed
-        {
+        if host.route.is_some() && !host.listed {
             host.listed = true;
             let server = self
                 .servers
-                .get_mut(&addr.ip())
-                .expect("a resolved host has a server");
+                .get_mut(&host.server)
+                .expect("a reachable host has a server");
             server.hosts.push_back(key);
-            schedule(server, addr.ip(), &mut self.ready, &mut self.order);
+            schedule(server, &host.server, &mut self.ready, &mut self.order);
         }
         true
     }
@@ -761,11 +897,9 @@ impl State {
             host.queue.push_back(job);
         }
         self.waiting += 1;
-        if let Some(addr) = host.addr
-            && !host.listed
-        {
+        if host.route.is_some() && !host.listed {
             host.listed = true;
-            if let Some(server) = self.servers.get_mut(&addr.ip()) {
+            if let Some(server) = self.servers.get_mut(&host.server) {
                 server.hosts.push_back(key.to_string());
             }
         }
@@ -816,12 +950,14 @@ impl State {
     /// The next request (or file saved by its link) a server is ready for;
     /// otherwise when one will be, if one has anything to ask.
     fn fetch_task(&mut self, now: Instant, settings: &Settings) -> Result<Next, Option<Instant>> {
-        while let Some(&Reverse((at, _, ip))) = self.ready.peek() {
-            if at > now {
-                return Err(Some(at));
+        while let Some(Reverse((at, _, _))) = self.ready.peek() {
+            if *at > now {
+                return Err(Some(*at));
             }
-            self.ready.pop();
-            let Some(server) = self.servers.get_mut(&ip) else {
+            let Some(Reverse((_, _, name))) = self.ready.pop() else {
+                break;
+            };
+            let Some(server) = self.servers.get_mut(&name) else {
                 continue;
             };
             server.scheduled = false;
@@ -850,7 +986,7 @@ impl State {
                     }
                     if job.kind == Kind::Page && (self.is_file)(&job.url) {
                         host.saved += 1;
-                        schedule(server, ip, &mut self.ready, &mut self.order);
+                        schedule(server, &name, &mut self.ready, &mut self.order);
                         self.active += 1;
                         return Ok(Next::Task(Box::new(Task::Save(Page {
                             title: Some(fallback_title(
@@ -859,16 +995,21 @@ impl State {
                                 self.untitled,
                             )),
                             url: job.url.to_string(),
-                            sources: vec![self.scheme.to_string()],
+                            sources: vec![self.name.to_string()],
                             crawled: Some(lost::store::now()),
                             ..Page::default()
                         }))));
                     }
                 }
-                let addr = host.addr.expect("listed hosts are resolved");
+                let route = host.route.expect("listed hosts are reachable");
                 server.busy = true;
                 self.active += 1;
-                return Ok(Next::Task(Box::new(Task::Fetch { ip, key, addr, job })));
+                return Ok(Next::Task(Box::new(Task::Fetch {
+                    server: name,
+                    key,
+                    route,
+                    job,
+                })));
             }
         }
         Err(None)
@@ -881,26 +1022,23 @@ impl State {
             self.retire(key);
             return;
         };
+        let name = addr.ip().to_string();
         let host = self.hosts.get_mut(key).expect("resolved hosts exist");
-        host.addr = Some(addr);
+        host.route = Some(Route::Direct(addr));
+        host.server = name.clone();
         if host.done || host.queue.is_empty() {
             return;
         }
         host.listed = true;
-        let server = self.servers.entry(addr.ip()).or_insert_with(|| Server {
-            hosts: VecDeque::new(),
-            busy: false,
-            scheduled: false,
-            next: Instant::now(),
-        });
+        let server = self.servers.entry(name.clone()).or_insert_with(new_server);
         server.hosts.push_back(key.to_string());
-        schedule(server, addr.ip(), &mut self.ready, &mut self.order);
+        schedule(server, &name, &mut self.ready, &mut self.order);
     }
 
     /// Takes in what a fetch came to; returns the page to save, if any.
     fn fetched(
         &mut self,
-        ip: IpAddr,
+        server: &str,
         key: &str,
         job: Job,
         outcome: Outcome,
@@ -1009,10 +1147,10 @@ impl State {
             Outcome::Nothing => {}
         }
 
-        if let Some(server) = self.servers.get_mut(&ip) {
-            server.busy = false;
-            server.next = next;
-            schedule(server, ip, &mut self.ready, &mut self.order);
+        if let Some(entry) = self.servers.get_mut(server) {
+            entry.busy = false;
+            entry.next = next;
+            schedule(entry, server, &mut self.ready, &mut self.order);
         }
         page_out
     }
@@ -1037,7 +1175,9 @@ impl<P: Protocol> Crawler<P> {
     /// links of the pages it `known`s already.
     pub fn new(protocol: P, settings: Settings, known: Known, links: &[String]) -> Arc<Crawler<P>> {
         let mut state = State {
-            scheme: P::SCHEME,
+            name: P::NAME,
+            accepts: P::accepts,
+            proxied: protocol.proxied(),
             robots_url: P::ROBOTS,
             robots_path: P::robots_path,
             is_file: P::is_file,
@@ -1142,9 +1282,7 @@ impl<P: Protocol> Crawler<P> {
             };
             match *task {
                 Task::Resolve(key, origin) => {
-                    let addr = self
-                        .protocol
-                        .resolve(&origin, origin.port.unwrap_or(self.protocol.port()));
+                    let addr = self.protocol.resolve(&origin);
                     self.state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1156,14 +1294,19 @@ impl<P: Protocol> Crawler<P> {
                         return;
                     }
                 }
-                Task::Fetch { ip, key, addr, job } => {
-                    let response = self.protocol.fetch(addr, &on_the_wire(&job.url));
+                Task::Fetch {
+                    server,
+                    key,
+                    route,
+                    job,
+                } => {
+                    let response = self.protocol.fetch(route, &on_the_wire(&job.url));
                     let outcome = self.outcome(&job, response);
                     let page = self
                         .state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .fetched(ip, &key, job, outcome, &self.settings);
+                        .fetched(&server, &key, job, outcome, &self.settings);
                     if let Some(page) = page
                         && out.send(page).is_err()
                     {
@@ -1193,7 +1336,7 @@ impl<P: Protocol> Crawler<P> {
                 body: Some(body),
             } => {
                 let parsed = self.protocol.parse(&job.url, &mime, &body);
-                if job.kind == Kind::Results {
+                if job.kind == Kind::Results || parsed.skip {
                     return Outcome::Follow(parsed.links);
                 }
                 let title = parsed.title.unwrap_or_else(|| {
@@ -1208,7 +1351,7 @@ impl<P: Protocol> Crawler<P> {
                     blocked,
                     page: Page {
                         url: job.url.to_string(),
-                        sources: vec![P::SCHEME.to_string()],
+                        sources: vec![P::NAME.to_string()],
                         title: Some(title),
                         body: parsed.body,
                         links: parsed.links.iter().map(|l| l.url.clone()).collect(),
@@ -1220,7 +1363,7 @@ impl<P: Protocol> Crawler<P> {
             Response::Document { body: None, .. } => Outcome::Page {
                 page: Page {
                     url: job.url.to_string(),
-                    sources: vec![P::SCHEME.to_string()],
+                    sources: vec![P::NAME.to_string()],
                     title: Some(fallback_title(
                         &job.url,
                         job.label.as_deref(),
@@ -1283,6 +1426,27 @@ mod tests {
         assert!(allows("/cgi-bin/calc.cgi/more"));
         assert!(!allows("/search?cats"));
         assert!(Robots::default().allows("/a"));
+    }
+
+    #[test]
+    fn md5_hashes() {
+        let hex = |data: &[u8]| lost::lostfile::to_hex(&md5(data));
+        assert_eq!(hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            hex(b"The quick brown fox jumps over the lazy dog"),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+        assert_eq!(hex(&[b'a'; 1000]), "cabe45dcc9ae5b66ba86600cca6b8ba8");
+        let mut list = Blacklist::default();
+        assert_eq!(list.ban_hashed([hex(b"bad.onion"), "not hex".into()]), 1);
+        let blocks = |u: &str| {
+            let url = Url::parse(u).unwrap();
+            list.blocks_url(&url, &url.to_string())
+        };
+        assert!(blocks("http://bad.onion/x"));
+        assert!(blocks("http://www.bad.onion/"));
+        assert!(!blocks("http://good.onion/"));
     }
 
     #[test]
@@ -1377,9 +1541,11 @@ mod tests {
     struct Fake {
         pages: HashMap<String, Response>,
         asked: Mutex<Vec<String>>,
+        proxied: bool,
     }
 
     impl Protocol for Fake {
+        const NAME: &'static str = "gemini";
         const SCHEME: &'static str = "gemini";
         const SPACE: &'static str = "Fakespace";
         const HOSTS: &'static str = "hosts";
@@ -1388,7 +1554,8 @@ mod tests {
             &[]
         }
 
-        fn fetch(&self, _: SocketAddr, url: &Url) -> Result<Response, String> {
+        fn fetch(&self, route: Route, url: &Url) -> Result<Response, String> {
+            assert_eq!(matches!(route, Route::Proxied), self.proxied);
             let url = url.to_string();
             self.asked.lock().unwrap().push(url.clone());
             if url.contains("down.test") {
@@ -1412,16 +1579,23 @@ mod tests {
                 title: None,
                 body: text.into_owned(),
                 links,
+                skip: false,
             }
         }
 
-        fn resolve(&self, url: &Url, port: u16) -> Option<SocketAddr> {
+        fn resolve(&self, url: &Url) -> Option<SocketAddr> {
+            assert!(!self.proxied, "nothing is looked up through a proxy");
             // Every *.test host lives on one server, except nowhere.test.
-            (!url.host.starts_with("nowhere")).then(|| SocketAddr::from(([127, 0, 0, 1], port)))
+            (!url.host.starts_with("nowhere"))
+                .then(|| SocketAddr::from(([127, 0, 0, 1], port(url))))
         }
 
-        fn port(&self) -> u16 {
-            1965
+        fn proxy(&self) -> Option<&crate::net::Proxy> {
+            None
+        }
+
+        fn proxied(&self) -> bool {
+            self.proxied
         }
     }
 
@@ -1438,9 +1612,20 @@ mod tests {
         known: Known,
         links: &[&str],
     ) -> (Vec<Page>, Vec<String>) {
+        crawl_via(false, pages, settings, known, links)
+    }
+
+    fn crawl_via(
+        proxied: bool,
+        pages: Vec<(&str, Response)>,
+        settings: Settings,
+        known: Known,
+        links: &[&str],
+    ) -> (Vec<Page>, Vec<String>) {
         let fake = Fake {
             pages: pages.into_iter().map(|(u, r)| (u.to_string(), r)).collect(),
             asked: Mutex::new(Vec::new()),
+            proxied,
         };
         let links: Vec<String> = links.iter().map(|l| l.to_string()).collect();
         let crawler = Crawler::new(fake, settings, known, &links);
@@ -1583,6 +1768,37 @@ mod tests {
     }
 
     #[test]
+    fn through_a_proxy() {
+        // Nothing is looked up; every host is its own server, and an
+        // unreachable one (down.test) is left alone after a few tries.
+        let pages = vec![
+            (
+                "gemini://a.test/",
+                doc("A =>gemini://b.test/ =>gemini://down.test/ =>gemini://nowhere.test/"),
+            ),
+            ("gemini://b.test/", doc("B")),
+            ("gemini://nowhere.test/", doc("Found through the proxy")),
+        ];
+        let (saved, asked) = crawl_via(
+            true,
+            pages,
+            settings(),
+            Known::default(),
+            &["gemini://a.test/"],
+        );
+        let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "gemini://a.test/",
+                "gemini://b.test/",
+                "gemini://nowhere.test/"
+            ]
+        );
+        assert!(asked.iter().filter(|u| u.contains("down.test")).count() <= MAX_FAILURES as usize);
+    }
+
+    #[test]
     fn not_wandering() {
         let pages = vec![
             (
@@ -1662,7 +1878,7 @@ mod tests {
                     links: links.into_iter().map(String::from).collect(),
                     ..Page::default()
                 },
-                "gemini",
+                Fake::accepts,
             );
         }
         let (saved, asked) = crawl(pages.clone(), settings(), known, &[]);

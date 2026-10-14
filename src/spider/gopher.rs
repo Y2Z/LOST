@@ -4,14 +4,14 @@
 //! host TAB port`; a URL's path is `/TYPE` and the selector, percent-encoded.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use lost::urls::Url;
 
 use crate::crawl::{
-    Link, Parsed, Protocol, Response, looks_like_posting, mentions, percent_decode,
+    Link, Parsed, Protocol, Response, Route, looks_like_posting, mentions, percent_decode, port,
 };
+use crate::net::{self, Proxy};
 
 /// Where a crawl starts, besides `--link`: Floodgap (home of Veronica-2,
 /// Gopherspace's search engine, and its list of servers), and some of the
@@ -31,30 +31,50 @@ const TEXT_TYPES: &[char] = &['0', '1', '7', 'h'];
 /// binaries, GIFs, images, PNGs, sounds, video, documents, PDFs.
 const FILE_TYPES: &[char] = &['4', '5', '6', '9', 'g', 'I', 'p', 's', ';', '<', 'd', 'P'];
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const IO_TIMEOUT: Duration = Duration::from_secs(15);
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait to connect, or for the next bit of an answer
+/// (`--timeout`); a whole answer gets four times that.
+pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// Through a proxy (Tor adds a few seconds a hop).
+pub const PROXIED_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longer items are cut here.
 const MAX_BODY: usize = 5 * 1024 * 1024;
 
-pub struct Gopher;
+pub struct Gopher {
+    /// A SOCKS5 proxy (Gopher can't go through an HTTP one).
+    proxy: Option<Proxy>,
+    timeout: Duration,
+}
+
+impl Gopher {
+    pub fn new(proxy: Option<Proxy>, timeout: Option<Duration>) -> lost::Result<Gopher> {
+        if let Some(Proxy::Http(_)) = proxy {
+            return Err("Gopher can only go through a SOCKS5 proxy (socks5://HOST:PORT)".into());
+        }
+        let timeout = timeout.unwrap_or(match proxy {
+            Some(_) => PROXIED_TIMEOUT,
+            None => TIMEOUT,
+        });
+        Ok(Gopher { proxy, timeout })
+    }
+}
 
 impl Protocol for Gopher {
+    const NAME: &'static str = "gopher";
     const SCHEME: &'static str = "gopher";
     const SPACE: &'static str = "Gopherspace";
     const HOSTS: &'static str = "gopherholes";
     /// Veronica-2's convention: a text file with the selector `robots.txt`.
     const ROBOTS: &'static str = "/0robots.txt";
 
-    fn port(&self) -> u16 {
-        70
+    fn proxy(&self) -> Option<&Proxy> {
+        self.proxy.as_ref()
     }
 
     fn seeds(&self) -> &'static [&'static str] {
         SEEDS
     }
 
-    fn fetch(&self, addr: SocketAddr, url: &Url) -> Result<Response, String> {
+    fn fetch(&self, route: Route, url: &Url) -> Result<Response, String> {
         let (kind, selector) = item(url);
         let search = url.query.as_deref().map(percent_decode);
         let request = match kind {
@@ -82,12 +102,13 @@ impl Protocol for Gopher {
             }
         };
 
-        let mut stream =
-            TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
-        stream
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
-            .map_err(|e| e.to_string())?;
+        let mut stream = net::connect(
+            route,
+            self.proxy.as_ref(),
+            &url.host,
+            port(url),
+            self.timeout,
+        )?;
         stream
             .write_all(format!("{request}\r\n").as_bytes())
             .map_err(|e| e.to_string())?;
@@ -96,7 +117,7 @@ impl Protocol for Gopher {
         let mut body = Vec::new();
         let mut buffer = [0u8; 16 * 1024];
         while body.len() < MAX_BODY {
-            if started.elapsed() > TOTAL_TIMEOUT {
+            if started.elapsed() > self.timeout * 4 {
                 return Err("too slow".into());
             }
             match stream.read(&mut buffer) {
@@ -133,9 +154,10 @@ impl Protocol for Gopher {
         match mime {
             "application/gopher-menu" => menu(&text),
             "text/html" => Parsed {
-                title: html_title(&text),
+                title: crate::http::html_title(&text),
                 body: lost::text::html_to_text(&text),
                 links: mentions(&text, Self::SCHEME),
+                skip: false,
             },
             _ => {
                 // A text file ends with a line holding a dot.
@@ -146,6 +168,7 @@ impl Protocol for Gopher {
                     title: None,
                     links: mentions(text, Self::SCHEME),
                     body: text.to_string(),
+                    skip: false,
                 }
             }
         }
@@ -257,6 +280,7 @@ fn menu(text: &str) -> Parsed {
         title: None,
         body: lines.join("\n").trim().to_string(),
         links,
+        skip: false,
     }
 }
 
@@ -275,21 +299,16 @@ fn decode(bytes: &[u8]) -> String {
     }
 }
 
-fn html_title(html: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let start = lower.find("<title")?;
-    let start = start + lower[start..].find('>')? + 1;
-    let end = start + lower[start..].find("</title")?;
-    let title = lost::text::single_line(&html[start..end]);
-    (!title.is_empty()).then_some(title)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn url(text: &str) -> Url {
         Url::parse(text).unwrap()
+    }
+
+    fn gopher() -> Gopher {
+        Gopher::new(None, None).unwrap()
     }
 
     #[test]
@@ -386,14 +405,14 @@ hMy website\tURL:https://example.com/\texample.org\t70\r
             }
             asked
         });
-        let fetch = |u: &str| Gopher.fetch(addr, &url(u)).unwrap();
+        let fetch = |u: &str| gopher().fetch(Route::Direct(addr), &url(u)).unwrap();
         match fetch("gopher://localhost/") {
             Response::Document {
                 mime,
                 body: Some(body),
             } => {
                 assert_eq!(mime, "application/gopher-menu");
-                let page = Gopher.parse(&url("gopher://localhost/"), &mime, &body);
+                let page = gopher().parse(&url("gopher://localhost/"), &mime, &body);
                 assert_eq!(page.links[0].url, "gopher://localhost/0/notes.txt");
             }
             other => panic!("{other:?}"),
@@ -421,7 +440,7 @@ hMy website\tURL:https://example.com/\texample.org\t70\r
 
     #[test]
     fn texts_and_errors() {
-        let page = Gopher.parse(
+        let page = gopher().parse(
             &url("gopher://x/0/a.txt"),
             "text/plain",
             b"Hello\r\nworld\r\n.\r\n",
@@ -432,7 +451,7 @@ hMy website\tURL:https://example.com/\texample.org\t70\r
         ));
         assert!(!is_error(b"3 little pigs\r\n"));
         assert_eq!(decode(&[0x63, 0x61, 0x66, 0xe9]), "café");
-        let page = Gopher.parse(
+        let page = gopher().parse(
             &url("gopher://x/h/a.html"),
             "text/html",
             b"<html><head><TITLE>My  page</TITLE></head><body><p>Hi</p></body></html>",

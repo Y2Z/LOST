@@ -4,17 +4,15 @@
 //! and, for status 2x, the document.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lost::urls::{Url, resolve_any};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
-use crate::crawl::{Link, Parsed, Protocol, Response, mentions};
+use crate::crawl::{Link, Parsed, Protocol, Response, Route, mentions, port};
+use crate::net::{self, Proxy};
 
 /// Where a crawl starts, besides `--link`: home pages, the lists of known
 /// capsules Gemini's search engines keep, a bulletin board and an
@@ -28,11 +26,11 @@ const SEEDS: &[&str] = &[
     "gemini://mozz.us/",
 ];
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// For each read and write once connected.
-const IO_TIMEOUT: Duration = Duration::from_secs(15);
-/// For a whole response.
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait to connect, or for the next bit of an answer
+/// (`--timeout`); a whole answer gets four times that.
+pub const TIMEOUT: Duration = Duration::from_secs(15);
+/// Through a proxy (Tor adds a few seconds a hop).
+pub const PROXIED_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longer documents are cut here.
 const MAX_BODY: usize = 5 * 1024 * 1024;
 /// A status line is at most `NN `, 1024 bytes of meta and CRLF.
@@ -40,41 +38,47 @@ const MAX_HEADER: usize = 1029;
 
 pub struct Gemini {
     tls: Arc<ClientConfig>,
+    /// A SOCKS5 proxy (Gemini can't go through an HTTP one).
+    proxy: Option<Proxy>,
+    timeout: Duration,
 }
 
 impl Gemini {
-    pub fn new() -> lost::Result<Gemini> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let tls = ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("can't set up TLS: {e}"))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
-            .with_no_client_auth();
-        Ok(Gemini { tls: Arc::new(tls) })
+    pub fn new(proxy: Option<Proxy>, timeout: Option<Duration>) -> lost::Result<Gemini> {
+        if let Some(Proxy::Http(_)) = proxy {
+            return Err("Gemini can only go through a SOCKS5 proxy (socks5://HOST:PORT)".into());
+        }
+        let timeout = timeout.unwrap_or(match proxy {
+            Some(_) => PROXIED_TIMEOUT,
+            None => TIMEOUT,
+        });
+        Ok(Gemini {
+            tls: net::any_certificate()?,
+            proxy,
+            timeout,
+        })
     }
 }
 
 impl Protocol for Gemini {
+    const NAME: &'static str = "gemini";
     const SCHEME: &'static str = "gemini";
     const SPACE: &'static str = "Geminispace";
     const HOSTS: &'static str = "capsules";
 
-    fn port(&self) -> u16 {
-        1965
+    fn proxy(&self) -> Option<&Proxy> {
+        self.proxy.as_ref()
     }
 
     fn seeds(&self) -> &'static [&'static str] {
         SEEDS
     }
 
-    fn fetch(&self, addr: SocketAddr, url: &Url) -> Result<Response, String> {
-        let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
-        tcp.set_read_timeout(Some(IO_TIMEOUT))
-            .and_then(|()| tcp.set_write_timeout(Some(IO_TIMEOUT)))
-            .map_err(|e| e.to_string())?;
+    fn fetch(&self, route: Route, url: &Url) -> Result<Response, String> {
         // Gemini wants the host name sent (SNI); an IPv6 literal goes bare.
         let host = url.host.trim_start_matches('[').trim_end_matches(']');
+        let tcp = net::connect(route, self.proxy.as_ref(), host, port(url), self.timeout)?;
+        let total = self.timeout * 4;
         let name = ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
         let connection =
             ClientConnection::new(self.tls.clone(), name).map_err(|e| e.to_string())?;
@@ -95,7 +99,7 @@ impl Protocol for Gemini {
             if data.len() > MAX_HEADER {
                 return Ok(Response::Gone);
             }
-            match read(&mut stream, &mut buffer, started)? {
+            match read(&mut stream, &mut buffer, started, total)? {
                 0 if data.is_empty() => return Err("closed without an answer".into()),
                 0 => break data.len(),
                 n => data.extend_from_slice(&buffer[..n]),
@@ -124,7 +128,7 @@ impl Protocol for Gemini {
                 }
                 let mut body = data.split_off((header_end + 1).min(data.len()));
                 while body.len() < MAX_BODY {
-                    match read(&mut stream, &mut buffer, started)? {
+                    match read(&mut stream, &mut buffer, started, total)? {
                         0 => break,
                         n => body.extend_from_slice(&buffer[..n]),
                     }
@@ -158,11 +162,13 @@ impl Protocol for Gemini {
                     .filter(|t| !t.is_empty()),
                 links: mentions(&text, Self::SCHEME),
                 body: text,
+                skip: false,
             },
             _ => Parsed {
                 title: None,
                 links: mentions(&text, Self::SCHEME),
                 body: text,
+                skip: false,
             },
         }
     }
@@ -170,8 +176,13 @@ impl Protocol for Gemini {
 
 /// One read, as Gemini servers end responses: many close the connection
 /// without TLS's goodbye, which counts as the end here, not an error.
-fn read(stream: &mut impl Read, buffer: &mut [u8], started: Instant) -> Result<usize, String> {
-    if started.elapsed() > TOTAL_TIMEOUT {
+fn read(
+    stream: &mut impl Read,
+    buffer: &mut [u8],
+    started: Instant,
+    total: Duration,
+) -> Result<usize, String> {
+    if started.elapsed() > total {
         return Err("too slow".into());
     }
     match stream.read(buffer) {
@@ -300,58 +311,7 @@ fn gemtext(base: &Url, text: &str) -> Parsed {
         title: title.or(any_heading).map(str::to_string),
         body: lines.join("\n").trim().to_string(),
         links,
-    }
-}
-
-/// Accepts any certificate. Gemini capsules sign their own (trust on first
-/// use, if anything), and the spider only reads public pages, so there's
-/// nothing to protect by checking them. The handshake's signatures are still
-/// checked, as TLS needs.
-#[derive(Debug)]
-struct AnyCertificate(Arc<CryptoProvider>);
-
-impl ServerCertVerifier for AnyCertificate {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        skip: false,
     }
 }
 

@@ -8,6 +8,10 @@
 mod crawl;
 mod gemini;
 mod gopher;
+mod http;
+mod i2p;
+mod net;
+mod onion;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,9 @@ use lost::urls::Url;
 use crate::crawl::{Blacklist, Crawler, Known, Protocol, Settings};
 use crate::gemini::Gemini;
 use crate::gopher::Gopher;
+use crate::i2p::I2p;
+use crate::net::Proxy;
+use crate::onion::Onion;
 
 const USAGE: &str = "\
 lost-spider — LOST's crawler. It wanders a network and saves what it finds
@@ -32,6 +39,8 @@ as a .lost file, signed with your ID, for LOST to import.
 Usage:
   lost-spider gemini [OPTIONS]    Wander Geminispace
   lost-spider gopher [OPTIONS]    Wander Gopherspace
+  lost-spider onion [OPTIONS]     Wander .onion sites, through Tor
+  lost-spider i2p [OPTIONS]       Wander I2P sites, through an I2P router
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -55,6 +64,14 @@ Options:
       --delay SECONDS     Wait between two requests to the same server
                           (default 1; decimals allowed)
       --host-limit N      Save at most N pages from one host (default: no limit)
+      --proxy URL         Go through a proxy: socks5://HOST:PORT (any network;
+                          Tor's is socks5://127.0.0.1:9050) or http://HOST:PORT
+                          (I2P only). onion uses Tor's by default, i2p
+                          http://127.0.0.1:4444
+  -t, --timeout SECONDS   How long to wait for a server to connect or send more
+                          (a whole page gets four times that). Defaults: gopher
+                          10, gemini 15, either through a proxy 30, onion 60,
+                          i2p 120
   -h, --help              Show this help
   -V, --version           Show the version
 
@@ -78,6 +95,8 @@ struct Options {
     dont_wander: bool,
     delay: Duration,
     host_limit: Option<u64>,
+    proxy: Option<Proxy>,
+    timeout: Option<Duration>,
 }
 
 fn main() -> ExitCode {
@@ -105,28 +124,32 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
             println!("lost-spider {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        "gemini" => {
-            let Some(options) = parse_options(&args[1..], Gemini::SCHEME)? else {
-                print!("{USAGE}");
-                return Ok(ExitCode::SUCCESS);
-            };
-            crawl(Gemini::new()?, options)
-        }
-        "gopher" => {
-            let Some(options) = parse_options(&args[1..], Gopher::SCHEME)? else {
-                print!("{USAGE}");
-                return Ok(ExitCode::SUCCESS);
-            };
-            crawl(Gopher, options)
-        }
-        other => {
-            Err(format!("unknown network \"{other}\" (lost-spider knows: gemini, gopher)").into())
-        }
+        "gemini" => start(&args[1..], Gemini::new),
+        "gopher" => start(&args[1..], Gopher::new),
+        "onion" => start(&args[1..], Onion::new),
+        "i2p" => start(&args[1..], I2p::new),
+        other => Err(format!(
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p)"
+        )
+        .into()),
     }
 }
 
+/// Reads the options for network `P` and crawls it.
+fn start<P: Protocol>(
+    args: &[String],
+    make: fn(Option<Proxy>, Option<Duration>) -> lost::Result<P>,
+) -> lost::Result<ExitCode> {
+    let Some(mut options) = parse_options::<P>(args)? else {
+        print!("{USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    };
+    let protocol = make(options.proxy.take(), options.timeout)?;
+    crawl(protocol, options)
+}
+
 /// `None` for `--help`.
-fn parse_options(args: &[String], scheme: &str) -> lost::Result<Option<Options>> {
+fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> {
     let mut options = Options {
         output: None,
         continue_: false,
@@ -136,6 +159,8 @@ fn parse_options(args: &[String], scheme: &str) -> lost::Result<Option<Options>>
         dont_wander: false,
         delay: Duration::from_secs(1),
         host_limit: None,
+        proxy: None,
+        timeout: None,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -153,10 +178,10 @@ fn parse_options(args: &[String], scheme: &str) -> lost::Result<Option<Options>>
             "-h" | "--help" => return Ok(None),
             "-o" | "--output" => options.output = Some(PathBuf::from(value()?)),
             "-c" | "--continue" => options.continue_ = true,
-            "--link" => options.links.push(link(&value()?, scheme)?),
+            "--link" => options.links.push(link::<P>(&value()?)?),
             "--links" => {
                 for line in lines(Path::new(&value()?))? {
-                    options.links.push(link(&line, scheme)?);
+                    options.links.push(link::<P>(&line)?);
                 }
             }
             "--search" => options.searches.push(value()?),
@@ -181,6 +206,16 @@ fn parse_options(args: &[String], scheme: &str) -> lost::Result<Option<Options>>
                 })?;
                 options.host_limit = Some(limit);
             }
+            "--proxy" => options.proxy = Some(Proxy::parse(&value()?)?),
+            "-t" | "--timeout" => {
+                let text = value()?;
+                let seconds: f64 = text
+                    .parse()
+                    .ok()
+                    .filter(|s: &f64| s.is_finite() && *s > 0.0 && *s <= 3600.0)
+                    .ok_or_else(|| format!("--timeout takes seconds, like 30 (not \"{text}\")"))?;
+                options.timeout = Some(Duration::from_secs_f64(seconds));
+            }
             other => return Err(format!("unknown option {other} (see lost-spider --help)").into()),
         }
     }
@@ -193,17 +228,18 @@ fn parse_options(args: &[String], scheme: &str) -> lost::Result<Option<Options>>
     Ok(Some(options))
 }
 
-/// A `--link`: `example.org` is taken as `gemini://example.org/`.
-fn link(text: &str, scheme: &str) -> lost::Result<String> {
+/// A `--link`: `example.org` is taken as `gemini://example.org/` (or the
+/// network's scheme).
+fn link<P: Protocol>(text: &str) -> lost::Result<String> {
     let text = text.trim();
     let full = if text.contains("://") {
         text.to_string()
     } else {
-        format!("{scheme}://{text}")
+        format!("{}://{text}", P::SCHEME)
     };
     match Url::parse(&full) {
-        Some(url) if url.scheme == scheme => Ok(url.to_string()),
-        _ => Err(format!("\"{text}\" isn't a {scheme}:// link").into()),
+        Some(url) if P::accepts(&url) => Ok(url.to_string()),
+        _ => Err(format!("\"{text}\" isn't a link lost-spider {} can follow", P::NAME).into()),
     }
 }
 
@@ -220,15 +256,26 @@ fn lines(path: &Path) -> lost::Result<Vec<String>> {
 }
 
 fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
-    let blacklist = match &options.blacklist {
+    let mut blacklist = match &options.blacklist {
         Some(path) => Blacklist::load(path)?,
         None => Blacklist::default(),
     };
+    if let Some(proxy) = protocol.proxy() {
+        proxy.check().map_err(|e| {
+            let hint = match P::NAME {
+                "onion" => " (is Tor running?)",
+                "i2p" => " (is the I2P router running?)",
+                _ => "",
+            };
+            format!("{e}{hint}")
+        })?;
+    }
+    protocol.prepare(&mut blacklist)?;
     let identity = load_identity();
-    let path = output_path(options.output.as_deref(), options.continue_, P::SCHEME)?;
+    let path = output_path(options.output.as_deref(), options.continue_, P::NAME)?;
 
     let (mut writer, known, path) = if options.continue_ && path.exists() {
-        let known = read_known(&path, P::SCHEME)?;
+        let known = read_known(&path, P::accepts)?;
         (Writer::append(&path, identity.as_ref())?, known, path)
     } else {
         let (file, path) = create_numbered(&path, !options.continue_)?;
@@ -365,7 +412,7 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
         );
         eprintln!(
             "To carry on: lost-spider {} -c -o \"{}\" (and the same options as before)",
-            P::SCHEME,
+            P::NAME,
             path.display()
         );
     }
@@ -465,7 +512,7 @@ fn name_of(path: &Path) -> String {
 }
 
 /// What a file being continued has already: every page's URL, text and links.
-fn read_known(path: &Path, scheme: &str) -> lost::Result<Known> {
+fn read_known(path: &Path, accepts: fn(&Url) -> bool) -> lost::Result<Known> {
     let mut reader = Reader::open(path)?;
     eprintln!("Reading {}…", reader.name());
     let mut known = Known::default();
@@ -474,7 +521,7 @@ fn read_known(path: &Path, scheme: &str) -> lost::Result<Known> {
         match reader.read_chunk(i)? {
             Some(chunk) => {
                 for page in chunk.pages {
-                    known.add(page, scheme);
+                    known.add(page, accepts);
                 }
             }
             None => damaged += 1,
@@ -511,21 +558,18 @@ mod tests {
     #[test]
     fn options() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let o = parse_options(
-            &args(&[
-                "-o",
-                "x.lost",
-                "-c",
-                "--link",
-                "example.org",
-                "--search=cats",
-                "--delay",
-                "0.5",
-                "--host-limit",
-                "10",
-            ]),
-            "gemini",
-        )
+        let o = parse_options::<Gemini>(&args(&[
+            "-o",
+            "x.lost",
+            "-c",
+            "--link",
+            "example.org",
+            "--search=cats",
+            "--delay",
+            "0.5",
+            "--host-limit",
+            "10",
+        ]))
         .unwrap()
         .unwrap();
         assert_eq!(o.output, Some(PathBuf::from("x.lost")));
@@ -534,15 +578,22 @@ mod tests {
         assert_eq!(o.searches, ["cats"]);
         assert_eq!(o.delay, Duration::from_millis(500));
         assert_eq!(o.host_limit, Some(10));
-        assert!(parse_options(&args(&["-c"]), "gemini").is_err());
-        assert!(parse_options(&args(&["--dont-wander"]), "gemini").is_err());
-        let o = parse_options(&args(&["--dont-wander", "--link", "a.org"]), "gemini");
+        let o = parse_options::<Onion>(&args(&["--proxy", "socks5://localhost:9150", "-t", "90"]));
+        let o = o.unwrap().unwrap();
+        assert_eq!(o.proxy, Some(Proxy::Socks5("localhost:9150".into())));
+        assert_eq!(o.timeout, Some(Duration::from_secs(90)));
+        assert!(parse_options::<Onion>(&args(&["--link", "example.org"])).is_err());
+        assert!(parse_options::<Gemini>(&args(&["--proxy", "localhost:9050"])).is_err());
+        assert!(parse_options::<Gemini>(&args(&["-t", "0"])).is_err());
+        assert!(parse_options::<Gemini>(&args(&["-c"])).is_err());
+        assert!(parse_options::<Gemini>(&args(&["--dont-wander"])).is_err());
+        let o = parse_options::<Gemini>(&args(&["--dont-wander", "--link", "a.org"]));
         assert!(o.unwrap().unwrap().dont_wander);
-        assert!(parse_options(&args(&["--link", "https://x.org/"]), "gemini").is_err());
-        assert!(parse_options(&args(&["--delay", "-1"]), "gemini").is_err());
-        assert!(parse_options(&args(&["--bogus"]), "gemini").is_err());
+        assert!(parse_options::<Gemini>(&args(&["--link", "https://x.org/"])).is_err());
+        assert!(parse_options::<Gemini>(&args(&["--delay", "-1"])).is_err());
+        assert!(parse_options::<Gemini>(&args(&["--bogus"])).is_err());
         assert!(
-            parse_options(&args(&["--help"]), "gemini")
+            parse_options::<Gemini>(&args(&["--help"]))
                 .unwrap()
                 .is_none()
         );
