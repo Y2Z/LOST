@@ -114,10 +114,14 @@ impl Default for GuiConfig {
 
 /// The per-user folder that holds both config and data:
 /// `~/.lost` (Linux, BSD), `~/Library/Application Support/LOST` (macOS),
-/// `%USERPROFILE%\LOST` (Windows).
+/// `%LOCALAPPDATA%\LOST` (Windows: `AppData\Local`, which roaming
+/// profiles never copy to a server, unlike `AppData\Roaming`; the database
+/// can be big, and the signing key shouldn't leave the computer).
 pub fn user_dir() -> Option<PathBuf> {
     if cfg!(windows) {
-        std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("LOST"))
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| PathBuf::from(dir).join("LOST"))
     } else {
         let home = PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?);
         if cfg!(target_os = "macos") {

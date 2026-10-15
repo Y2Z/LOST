@@ -124,7 +124,7 @@ It obeys robots.txt, asks each server for one thing a second (`--delay`), and sa
 ### Database
 
 The local database is stored by default either in `~/.lost/` (Linux, BSD), `~/Library/Application Support/LOST/` (macOS),
-or `%USERPROFILE%\LOST\` (Windows).
+or `%LOCALAPPDATA%\LOST\` (Windows, i.e. `C:\Users\NAME\AppData\Local\LOST\`).
 
 
 ## Building
