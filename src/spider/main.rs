@@ -1,6 +1,6 @@
 //! lost-spider: LOST's crawler (ARCHITECTURE.md §15). It crawls a network
-//! and saves what it finds as a signed `.lost` file, which LOST imports like
-//! any other. It's a program of its own, built only on request
+//! and saves what it finds as a `.lost` file (unsigned unless asked), which
+//! LOST imports like any other. It's a program of its own, built only on request
 //! (`--features spider`), so that LOST itself never goes online: it uses
 //! LOST's library for the `.lost` format and your ID, and nothing in LOST
 //! knows it exists.
@@ -34,7 +34,7 @@ use crate::onion::Onion;
 
 const USAGE: &str = "\
 lost-spider — LOST's crawler. It crawls a network and saves what it finds
-as a .lost file, signed with your ID, for LOST to import.
+as a .lost file for LOST to import.
 
 Usage:
   lost-spider gemini [OPTIONS]    Crawl Geminispace
@@ -47,12 +47,16 @@ Options:
                           (default: lost-crawl-data-NETWORK-DATE-TIME.lost here;
                           if the file exists, \" (1)\", \" (2)\"… is added)
   -c, --continue          Carry on with the -o file: its pages are kept, links
-                          they lead to are crawled, and the file is signed
-                          with your ID. Give the other options again
+                          they lead to are crawled. Its signature, if any, is
+                          removed (or replaced by yours, with --sign). Give
+                          the other options again
+      --sign              Sign the file with your ID (made if you have none).
+                          Files are unsigned otherwise: a signature says who
+                          made them
       --link URL          Crawl this first, even if nothing links to it
                           (repeat for more)
       --links FILE        The same, one URL a line
-      --dont-crawl       Fetch only the --link URLs, and follow none of their
+      --dont-crawl        Fetch only the --link URLs, and follow none of their
                           links: to add those pages to a file, and nothing else
       --search PHRASE     Type PHRASE into the search boxes found, and crawl
                           what they find (repeat for more). Only boxes that
@@ -93,6 +97,7 @@ struct Options {
     searches: Vec<String>,
     blacklist: Option<PathBuf>,
     dont_crawl: bool,
+    sign: bool,
     delay: Duration,
     host_limit: Option<u64>,
     proxy: Option<Proxy>,
@@ -157,6 +162,7 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
         searches: Vec::new(),
         blacklist: None,
         dont_crawl: false,
+        sign: false,
         delay: Duration::from_secs(1),
         host_limit: None,
         proxy: None,
@@ -188,6 +194,7 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
             "--searches" => options.searches.extend(lines(Path::new(&value()?))?),
             "--blacklist" => options.blacklist = Some(PathBuf::from(value()?)),
             "--dont-crawl" => options.dont_crawl = true,
+            "--sign" => options.sign = true,
             "--delay" => {
                 let text = value()?;
                 let seconds: f64 = text
@@ -271,7 +278,12 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
         })?;
     }
     protocol.prepare(&mut blacklist)?;
-    let identity = load_identity();
+    // Unsigned unless asked: no ID is read or made without --sign.
+    let identity = if options.sign {
+        Some(load_identity()?)
+    } else {
+        None
+    };
     let path = output_path(options.output.as_deref(), options.continue_, P::NAME)?;
 
     let (mut writer, known, path) = if options.continue_ && path.exists() {
@@ -440,24 +452,19 @@ fn duration(elapsed: Duration) -> String {
 
 /// Your ID, made if there isn't one yet; `None` if LOST's folder can't be
 /// found (no home folder).
-fn load_identity() -> Option<Identity> {
-    let dir = Identity::default_dir()?;
-    match Identity::load_or_create(&dir) {
-        Ok((identity, created)) => {
-            if created {
-                eprintln!(
-                    "Made your ID: {} (kept in {}).",
-                    identity.id(),
-                    dir.display()
-                );
-            }
-            Some(identity)
-        }
-        Err(e) => {
-            eprintln!("lost-spider: {e}; the file won't be signed");
-            None
-        }
+fn load_identity() -> lost::Result<Identity> {
+    let dir = Identity::default_dir()
+        .ok_or("--sign needs your ID, and LOST's folder can't be found (no home folder)")?;
+    let (identity, created) = Identity::load_or_create(&dir)
+        .map_err(|e| format!("--sign needs your ID, which can't be read or made: {e}"))?;
+    if created {
+        eprintln!(
+            "Made your ID: {} (kept in {}).",
+            identity.id(),
+            dir.display()
+        );
     }
+    Ok(identity)
 }
 
 /// The file to write: `-o` as given, or a default name in the folder `-o`
@@ -634,6 +641,13 @@ mod tests {
         assert!(parse_options::<Gemini>(&args(&["--dont-crawl"])).is_err());
         let o = parse_options::<Gemini>(&args(&["--dont-crawl", "--link", "a.org"]));
         assert!(o.unwrap().unwrap().dont_crawl);
+        assert!(!parse_options::<Gemini>(&args(&[])).unwrap().unwrap().sign);
+        assert!(
+            parse_options::<Gemini>(&args(&["--sign"]))
+                .unwrap()
+                .unwrap()
+                .sign
+        );
         assert!(parse_options::<Gemini>(&args(&["--link", "https://x.org/"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--delay", "-1"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--bogus"])).is_err());

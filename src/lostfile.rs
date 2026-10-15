@@ -1067,6 +1067,12 @@ mod file_tests {
             Reader::open(&theirs).unwrap().header().query.as_deref(),
             Some("example")
         );
+        // And unsigned (lost-spider without --sign): their signature is gone,
+        // the pages stay.
+        let mut writer = Writer::append(&theirs, None).unwrap();
+        writer.add(&page(4)).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(pages_of(&theirs), ((0..5).map(page).collect(), None));
 
         // Appending to an unsigned file: the header grows, the chunks move.
         let plain = temp("plain-append.lost");
