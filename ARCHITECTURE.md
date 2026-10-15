@@ -953,7 +953,7 @@ Sites and files addressed by their content (`ipfs://CID/…`), and names that po
   - `--link` takes any of them: `--link docs.ipfs.tech` is `ipns://docs.ipfs.tech/`, `--link Qm…` is its `ipfs://bafy…/`.
 - **Links:** those of §15.6's HTML, plus `ipfs://` and `ipns://` URLs written in the text. Only `ipfs://` and `ipns://` are crawled; the others (the web) are kept in `links`.
 - **Servers:** every `ipfs://` CID and `ipns://` name is a host, with its own robots.txt (`/robots.txt` under it) and `--host-limit`. Through a gateway on this computer, each is a server of its own, so many are asked at once; through any other, they're all one server.
-- Before crawling, the gateway must answer a connection, or the spider stops ("is your IPFS node running? (ipfs daemon)").
+- Before crawling, the gateway must answer a connection, or the spider stops ("is your IPFS node running? (ipfs daemon)"). Then, since a node finds nothing until it's connected to other nodes (its gateway answers every request with a 504 after its own timeout, 30 s in Kubo), the first seed is asked for until something other than a 5xx comes back: every 10 seconds for up to 10 minutes, saying "Waiting for the IPFS node to find content (the gateway answered 504: …)…" with the gateway's reason, and giving up with it.
 - Seeds: the IPFS project's sites (`docs.ipfs.tech`, `blog.ipfs.tech`, `specs.ipfs.tech`, `ipfs.tech`, all DNSLink) and an ENS site (`vitalik.eth`). More with `--links`.
 - Default timeout 60 s: content not cached by the node is looked up on the network first.
 

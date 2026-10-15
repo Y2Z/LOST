@@ -11,7 +11,7 @@
 //! `https://….ipfs.dweb.link/…`) as `ipfs://` links (ARCHITECTURE.md §15.7).
 
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lost::urls::Url;
 
@@ -23,6 +23,8 @@ use crate::net::Proxy;
 /// Finding content on the network the first time can take a while.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 pub const GATEWAY: &str = "http://127.0.0.1:8080";
+/// How long to wait for a node that has just started to find content.
+const WARM_UP: Duration = Duration::from_secs(10 * 60);
 
 /// Where a crawl starts: the IPFS project's own sites (DNSLink), and an
 /// ENS name's.
@@ -217,7 +219,53 @@ impl Protocol for Ipfs {
                 format!("can't reach the IPFS gateway at {address} ({e}){hint}")
             })?;
         }
-        Ok(())
+        // A node finds nothing until it's connected to other nodes, a few
+        // seconds to minutes after it starts; until then its gateway answers
+        // every request with an error (504, after its own timeout). So the
+        // first seed is asked for until it comes.
+        let probe = Url::parse(SEEDS[0]).expect("a valid URL");
+        let started = Instant::now();
+        let mut waiting = false;
+        loop {
+            let problem = match self.http.get(self.route(), &self.on_gateway(&probe)) {
+                Ok(answer) if answer.status < 500 => {
+                    if waiting {
+                        eprintln!("The IPFS node is finding content.");
+                    }
+                    return Ok(());
+                }
+                Ok(answer) => format!(
+                    "the gateway answered {}{}",
+                    answer.status,
+                    reason(&answer.body)
+                ),
+                Err(e) => e,
+            };
+            if started.elapsed() >= WARM_UP {
+                return Err(format!(
+                    "the IPFS node couldn't fetch {} in {} minutes ({problem}); \
+                     is it connected to other nodes? (ipfs swarm peers)",
+                    SEEDS[0],
+                    WARM_UP.as_secs() / 60
+                )
+                .into());
+            }
+            if !waiting {
+                eprintln!("Waiting for the IPFS node to find content ({problem})…");
+                waiting = true;
+            }
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+}
+
+/// What a gateway's error page says, if anything: `: its first line`.
+fn reason(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty());
+    match line {
+        Some(line) => format!(": {}", line.chars().take(200).collect::<String>()),
+        None => String::new(),
     }
 }
 
@@ -596,6 +644,47 @@ mod tests {
 
     fn url(text: &str) -> Url {
         Url::parse(text).unwrap()
+    }
+
+    #[test]
+    fn waiting_for_the_node() {
+        // The gateway's check, then the first seed, which comes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (check, _) = listener.accept().unwrap();
+            drop(check);
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>Docs</p>")
+                .unwrap();
+            first
+        });
+        let ipfs = Ipfs::new(
+            Some(format!("http://{addr}")),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        ipfs.prepare(&mut Blacklist::default()).unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            "GET /ipns/docs.ipfs.tech/ HTTP/1.1\r\n"
+        );
+        assert_eq!(
+            reason(b"\n  ipfs resolve -r /ipns/x: context deadline exceeded\nmore"),
+            ": ipfs resolve -r /ipns/x: context deadline exceeded"
+        );
+        assert_eq!(reason(b""), "");
     }
 
     #[test]
