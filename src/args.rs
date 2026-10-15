@@ -41,7 +41,7 @@ Server options:
   -p, --port PORT         Port to listen on (default 1057)
 
 Export options:
-      --unsigned          Don't sign the file (it's signed by default)
+      --sign              Sign the file with your ID (unsigned by default)
 
 Data options:
   -f, --format FORMAT     --imports and --trusted: plain (default) or json
@@ -87,7 +87,7 @@ pub struct Args {
     pub help: bool,
     pub version: bool,
     pub suggest: Option<String>,
-    pub unsigned: bool,
+    pub sign: bool,
     pub imports: bool,
     pub remove_import: Option<u64>,
     pub trusted: bool,
@@ -159,7 +159,7 @@ where
 
         // Long-only options.
         match arg.as_str() {
-            "--unsigned" => out.unsigned = true,
+            "--sign" => out.sign = true,
             "--imports" => out.imports = true,
             "--trusted" => out.trusted = true,
             "--new-id" => out.new_id = true,
@@ -169,7 +169,7 @@ where
         }
         if matches!(
             arg.as_str(),
-            "--unsigned" | "--imports" | "--trusted" | "--new-id" | "--minimized" | "--yes"
+            "--sign" | "--imports" | "--trusted" | "--new-id" | "--minimized" | "--yes"
         ) {
             continue;
         }
@@ -350,8 +350,8 @@ impl Args {
         {
             return Err(format!("{name} only applies to a search"));
         }
-        if self.unsigned && !exporting {
-            return Err("--unsigned only applies to -e".into());
+        if self.sign && !exporting {
+            return Err("--sign only applies to -e".into());
         }
         if self.yes && self.remove_import.is_none() && !self.new_id {
             return Err("--yes only applies to --remove-import and --new-id".into());
@@ -463,12 +463,13 @@ mod tests {
         assert_eq!(p("-d a.csv -d b.csv").unwrap().data.len(), 2);
         assert_eq!(p("-d a.csv").unwrap().mode(), Ok(Mode::Import));
         assert_eq!(p("-e out.lost").unwrap().mode(), Ok(Mode::Export));
-        let a = p("-e out.lost site:example.com catfish --unsigned").unwrap();
+        let a = p("-e out.lost site:example.com catfish --sign").unwrap();
         assert_eq!(a.mode(), Ok(Mode::Export));
         assert_eq!(a.query, vec!["site:example.com", "catfish"]);
-        assert!(a.unsigned);
+        assert!(a.sign);
+        assert!(!p("-e out.lost").unwrap().sign);
         assert!(p("-e out.lost -l 10 catfish").unwrap().mode().is_err());
-        assert!(p("catfish --unsigned").unwrap().mode().is_err());
+        assert!(p("catfish --sign").unwrap().mode().is_err());
         assert_eq!(p("-i -").unwrap().mode(), Ok(Mode::Search));
         assert_eq!(p("-h catfish").unwrap().mode(), Ok(Mode::Help));
         let a = parse(["--suggest", "how to _"]).unwrap();

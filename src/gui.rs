@@ -454,29 +454,18 @@ enum Dialog {
     DataDir,
 }
 
+#[derive(Default)]
 struct ExportState {
     running: bool,
     done: u64,
     total: u64,
-    /// Sign the file. Ticked every time: the choice isn't remembered.
+    /// Sign the file. Unticked every time: the choice isn't remembered, so
+    /// a file is only signed when you mean it to be.
     sign: bool,
     /// What the last export did, under its button.
     message: Option<std::result::Result<String, String>>,
     /// Your ID, once you have a signing key.
     id: Option<String>,
-}
-
-impl Default for ExportState {
-    fn default() -> Self {
-        ExportState {
-            running: false,
-            done: 0,
-            total: 0,
-            sign: true,
-            message: None,
-            id: None,
-        }
-    }
 }
 
 /// Sizes measured while drawing, used on the next frame: boxes of equal
@@ -1236,7 +1225,7 @@ impl State {
         self.export.running = true;
         self.export.done = 0;
         self.export.total = 0;
-        self.export.sign = true; // ticked again next time
+        self.export.sign = false; // unticked again next time
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1332,7 +1321,7 @@ impl State {
         }
         if self.settings.is_none() {
             self.load_trusted();
-            self.export.sign = true;
+            self.export.sign = false;
         }
         self.settings = Some(page);
         self.raise_settings = true;
