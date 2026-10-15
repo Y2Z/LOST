@@ -239,9 +239,9 @@ Planned dependencies (to be added as each part is implemented):
 | System service | `/etc/lost/lost.toml` | `/var/lib/lost/.lost/` (`lost.service` sets `HOME=/var/lib/lost`) |
 | User (Linux, BSD) | `~/.lost/lost.toml` | `~/.lost/` |
 | User (macOS) | `~/Library/Application Support/LOST/lost.toml` | `~/Library/Application Support/LOST/` |
-| User (Windows) | `%USERPROFILE%\LOST\lost.toml` | `%USERPROFILE%\LOST\` |
+| User (Windows) | `%LOCALAPPDATA%\LOST\lost.toml` | `%LOCALAPPDATA%\LOST\` |
 
-One folder per user holds both config and data. It's created readable by its owner only, since it also holds the signing key (§9.2).
+One folder per user holds both config and data. It's created readable by its owner only, since it also holds the signing key (§9.2). On Windows it's in `AppData\Local` (`C:\Users\NAME\AppData\Local\LOST\`), as Bitcoin Core's is since 28.0: unlike `AppData\Roaming`, it's never copied to a server by roaming profiles, which matters for a big database and for a key that shouldn't leave the computer.
 
 Configuration precedence: command-line flag → the user's `lost.toml` → `/etc/lost/lost.toml` → built-in default.
 

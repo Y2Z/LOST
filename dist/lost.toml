@@ -1,6 +1,6 @@
 # LOST configuration.
 # System-wide: /etc/lost/lost.toml. Per user: ~/.lost/lost.toml (Linux/BSD),
-# ~/Library/Application Support/LOST/lost.toml (macOS), %USERPROFILE%\LOST\lost.toml (Windows).
+# ~/Library/Application Support/LOST/lost.toml (macOS), %LOCALAPPDATA%\LOST\lost.toml (Windows).
 # Every key is optional; command-line flags override this file.
 
 [server]
