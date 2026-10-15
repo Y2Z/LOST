@@ -310,7 +310,7 @@ The loser is discarded, never archived. On a tie the existing version stays, so 
 
 Merging only works if every source spells a URL the same way. The **key** is computed from a normalized URL; the **original** URL is kept for display.
 
-- Lowercase scheme and host; remove default ports (`:80`, `:443`).
+- Lowercase scheme and host — except the "hosts" of `ipfs://` and `ipns://`, which are content IDs and keys, where base58 (`Qm…`, `12D3Koo…`) is case-sensitive; remove default ports (`:80`, `:443`).
 - `http`/`https` and `www.`/no `www.` are treated as the same page.
 - Remove tracking parameters (`utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `ref`, …); keep all other query parameters as they are.
 - Remove a trailing slash from the path (except for the root `/`).
@@ -794,7 +794,8 @@ lost/
         ├── gemini.rs         Gemini: TLS, responses, gemtext
         ├── gopher.rs         Gopher: selectors, menus
         ├── onion.rs          .onion sites through Tor; Ahmia's banned list
-        └── i2p.rs            I2P sites through a router; address books
+        ├── i2p.rs            I2P sites through a router; address books
+        └── ipfs.rs           IPFS through a gateway; CIDs, one way to write them
 ```
 
 ### 13.1 Library API (sketch)
@@ -849,10 +850,10 @@ A crawler for the networks LOST can't get dumps of. It saves what it finds as a 
 ```
 lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
                     [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS]
-                    [--host-limit N] [--proxy URL] [-t SECONDS]
+                    [--host-limit N] [--proxy URL] [--gateway URL] [-t SECONDS]
 ```
 
-`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` (§15.6) or `i2p` (§15.7); the options are the same for each.
+`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), or `ipfs` (§15.7); the options are the same for each, but for `--gateway`, which is `ipfs`'s.
 
 | Option | What it does |
 |---|---|
@@ -866,7 +867,8 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | `--delay SECONDS` | Between two requests to the same server; default 1, decimals allowed |
 | `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
 | `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
-| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
+| `--gateway URL` | `ipfs` only: the IPFS gateway to ask, `http://HOST:PORT` or `https://HOST` (default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
+| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, IPFS 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Unsigned ("Saving to NAME, unsigned."), or with `--sign` signed with your ID ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."). If `--sign` is given and the ID can't be read or made, the spider stops before crawling rather than leave the file unsigned.
@@ -937,6 +939,23 @@ Both are ordinary websites reached through a proxy, so they share an HTTP client
 - Default timeout 120 s: a site reached for the first time can take a minute or more while the router builds tunnels.
 
 Darknets in particular host material no one wants in a dataset: `--blacklist`'s `title:/…/` and `body:/…/` rules keep pages out by what they say, and their links aren't followed.
+
+### 15.7 IPFS (`ipfs.rs`)
+
+Sites and files addressed by their content (`ipfs://CID/…`), and names that point to the latest version of something (`ipns://NAME/…`), fetched over HTTP from an IPFS node's gateway (`--gateway`, §15.1), which finds the content on the network and looks names up. With Kubo, that includes ENS names (`vitalik.eth`), resolved through eth.limo's DNS-over-HTTPS by default in current versions (`ipfs config --json DNS.Resolvers '{"eth.": "https://dns.eth.limo/dns-query"}'` in older ones).
+
+- **Requests:** `ipfs://CID/path?query` is `GET /ipfs/CID/path?query` on the gateway, `ipns://NAME/…` `GET /ipns/NAME/…`, through the HTTP client of §15.6. Its answers are read as there, but for a 5xx (not found on the network in time, or a name the node can't look up), which counts as the site being unreachable (§15.2's failures) — unless it says the path isn't in the content ("no link named …", a robots.txt asked of a file, say), which is "not found" — and redirects, which come back as `ipfs://` and `ipns://` URLs (the gateway's `/ipfs/CID/dir/` for a folder without its `/`). A folder without an `index.html` is the gateway's listing of it: a page of file names, whose links are followed.
+- **One way to write an address.** Pages are saved, and links kept, as:
+  - `ipfs://` + the CID as CIDv1 in base32 (`bafy…`), whatever it was written as: CIDv0 (`Qm…`, base58), or CIDv1 in base32, base36, base58 or hex. Its bytes are checked: a CID's version, codec and multihash.
+  - `ipns://` + a key as CIDv1 in base36 (`k51…`), from an Ed25519 peer ID (`12D3Koo…`) or a key's CIDv1 in any base; or a domain, lowercase (DNSLink, `docs.ipfs.tech`; ENS, `vitalik.eth`). A CID given as an IPNS name is content (`ipfs://`); so is `Qm…`, which old RSA peer IDs looked like, but almost always is content.
+  - From gateways: a path (`https://ipfs.io/ipfs/CID/…`, any host, when what follows `/ipfs/` is a CID, or `/ipns/` a key or a domain), or a subdomain (`https://CID.ipfs.dweb.link/…`; `https://docs-ipfs-tech.ipns.dweb.link/…`, a DNSLink name made one label: `-` for `.`, `--` for `-`). `/ipfs/CID/…` on an IPFS page, as folder listings link, is that CID's.
+  - Queries (gateways' `?filename=`, `?format=`…) and fragments go.
+  - `--link` takes any of them: `--link docs.ipfs.tech` is `ipns://docs.ipfs.tech/`, `--link Qm…` is its `ipfs://bafy…/`.
+- **Links:** those of §15.6's HTML, plus `ipfs://` and `ipns://` URLs written in the text. Only `ipfs://` and `ipns://` are crawled; the others (the web) are kept in `links`.
+- **Servers:** every `ipfs://` CID and `ipns://` name is a host, with its own robots.txt (`/robots.txt` under it) and `--host-limit`. Through a gateway on this computer, each is a server of its own, so many are asked at once; through any other, they're all one server.
+- Before crawling, the gateway must answer a connection, or the spider stops ("is your IPFS node running? (ipfs daemon)").
+- Seeds: the IPFS project's sites (`docs.ipfs.tech`, `blog.ipfs.tech`, `specs.ipfs.tech`, `ipfs.tech`, all DNSLink) and an ENS site (`vitalik.eth`). More with `--links`.
+- Default timeout 60 s: content not cached by the node is looked up on the network first.
 
 ---
 

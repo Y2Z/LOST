@@ -10,6 +10,7 @@ mod gemini;
 mod gopher;
 mod http;
 mod i2p;
+mod ipfs;
 mod net;
 mod onion;
 
@@ -29,6 +30,7 @@ use crate::crawl::{Blacklist, Crawler, Known, Protocol, Settings};
 use crate::gemini::Gemini;
 use crate::gopher::Gopher;
 use crate::i2p::I2p;
+use crate::ipfs::Ipfs;
 use crate::net::Proxy;
 use crate::onion::Onion;
 
@@ -41,6 +43,8 @@ Usage:
   lost-spider gopher [OPTIONS]    Crawl Gopherspace
   lost-spider onion [OPTIONS]     Crawl .onion sites, through Tor
   lost-spider i2p [OPTIONS]       Crawl I2P sites, through an I2P router
+  lost-spider ipfs [OPTIONS]      Crawl IPFS sites (and ENS names), through an
+                                  IPFS node's gateway
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -70,12 +74,15 @@ Options:
       --host-limit N      Save at most N pages from one host (default: no limit)
       --proxy URL         Go through a proxy: socks5://HOST:PORT (any network;
                           Tor's is socks5://127.0.0.1:9050) or http://HOST:PORT
-                          (I2P only). onion uses Tor's by default, i2p
-                          http://127.0.0.1:4444
+                          (I2P, or an http:// IPFS gateway). onion uses Tor's
+                          by default, i2p http://127.0.0.1:4444
+      --gateway URL       ipfs: the IPFS gateway to ask (default
+                          http://127.0.0.1:8080, Kubo's; a public one such as
+                          https://ipfs.io is asked one thing at a time)
   -t, --timeout SECONDS   How long to wait for a server to connect or send more
                           (a whole page gets four times that). Defaults: gopher
                           10, gemini 15, either through a proxy 30, onion 60,
-                          i2p 120
+                          ipfs 60, i2p 120
   -h, --help              Show this help
   -V, --version           Show the version
 
@@ -101,6 +108,7 @@ struct Options {
     delay: Duration,
     host_limit: Option<u64>,
     proxy: Option<Proxy>,
+    gateway: Option<String>,
     timeout: Option<Duration>,
 }
 
@@ -129,12 +137,15 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
             println!("lost-spider {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        "gemini" => start(&args[1..], Gemini::new),
-        "gopher" => start(&args[1..], Gopher::new),
-        "onion" => start(&args[1..], Onion::new),
-        "i2p" => start(&args[1..], I2p::new),
+        "gemini" => start(&args[1..], |o| Gemini::new(o.proxy.take(), o.timeout)),
+        "gopher" => start(&args[1..], |o| Gopher::new(o.proxy.take(), o.timeout)),
+        "onion" => start(&args[1..], |o| Onion::new(o.proxy.take(), o.timeout)),
+        "i2p" => start(&args[1..], |o| I2p::new(o.proxy.take(), o.timeout)),
+        "ipfs" => start(&args[1..], |o| {
+            Ipfs::new(o.gateway.take(), o.proxy.take(), o.timeout)
+        }),
         other => Err(format!(
-            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p)"
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs)"
         )
         .into()),
     }
@@ -143,13 +154,13 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
 /// Reads the options for network `P` and crawls it.
 fn start<P: Protocol>(
     args: &[String],
-    make: fn(Option<Proxy>, Option<Duration>) -> lost::Result<P>,
+    make: impl FnOnce(&mut Options) -> lost::Result<P>,
 ) -> lost::Result<ExitCode> {
     let Some(mut options) = parse_options::<P>(args)? else {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     };
-    let protocol = make(options.proxy.take(), options.timeout)?;
+    let protocol = make(&mut options)?;
     crawl(protocol, options)
 }
 
@@ -166,6 +177,7 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
         delay: Duration::from_secs(1),
         host_limit: None,
         proxy: None,
+        gateway: None,
         timeout: None,
     };
     let mut args = args.iter();
@@ -214,6 +226,8 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
                 options.host_limit = Some(limit);
             }
             "--proxy" => options.proxy = Some(Proxy::parse(&value()?)?),
+            "--gateway" if P::NAME == "ipfs" => options.gateway = Some(value()?),
+            "--gateway" => return Err("--gateway is for lost-spider ipfs".into()),
             "-t" | "--timeout" => {
                 let text = value()?;
                 let seconds: f64 = text
@@ -244,6 +258,7 @@ fn link<P: Protocol>(text: &str) -> lost::Result<String> {
     } else {
         format!("{}://{text}", P::SCHEME)
     };
+    let full = P::rewrite(&full).unwrap_or(full);
     match Url::parse(&full) {
         Some(url) if P::accepts(&url) => Ok(url.to_string()),
         _ => Err(format!("\"{text}\" isn't a link lost-spider {} can follow", P::NAME).into()),
@@ -651,6 +666,30 @@ mod tests {
         assert!(parse_options::<Gemini>(&args(&["--link", "https://x.org/"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--delay", "-1"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--bogus"])).is_err());
+        // IPFS: a gateway, and links written the one way.
+        let o = parse_options::<Ipfs>(&args(&[
+            "--gateway",
+            "https://ipfs.io",
+            "--link",
+            "docs.ipfs.tech",
+            "--link",
+            "QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR",
+            "--link",
+            "https://ipfs.io/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR/a",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(o.gateway.as_deref(), Some("https://ipfs.io"));
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        assert_eq!(
+            o.links,
+            [
+                "ipns://docs.ipfs.tech/".to_string(),
+                format!("ipfs://{cid}/"),
+                format!("ipfs://{cid}/a"),
+            ]
+        );
+        assert!(parse_options::<Gemini>(&args(&["--gateway", "http://x:1"])).is_err());
         assert!(
             parse_options::<Gemini>(&args(&["--help"]))
                 .unwrap()

@@ -90,6 +90,12 @@ pub trait Protocol: Send + Sync + 'static {
         url.scheme == Self::SCHEME
     }
 
+    /// The way pages are saved under for a link written another way (IPFS's
+    /// CIDs and gateway links, say); `None` to take it as it is.
+    fn rewrite(_link: &str) -> Option<String> {
+        None
+    }
+
     /// Where a host's robots.txt is.
     const ROBOTS: &'static str = "/robots.txt";
 

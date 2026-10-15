@@ -243,7 +243,8 @@ fn base64_i2p(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn base32(bytes: &[u8]) -> String {
+/// RFC 4648 base32, lowercase, without padding (also IPFS's `b…` CIDs).
+pub(crate) fn base32(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut out = String::with_capacity(bytes.len() * 8 / 5 + 1);
     let (mut bits, mut count) = (0u32, 0);

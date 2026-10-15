@@ -14,7 +14,9 @@ const TRACKING_PARAMS: &[&str] = &[
 pub struct Url {
     /// Lowercase scheme, e.g. `https`.
     pub scheme: String,
-    /// Lowercase host, without port or credentials.
+    /// Lowercase host, without port or credentials. Except for `ipfs://` and
+    /// `ipns://`, whose "hosts" are content IDs and keys, where `Qm…` and
+    /// `12D3Koo…` (base58) mean something else in another case.
     pub host: String,
     /// Port, if one was given and it isn't the scheme's default.
     pub port: Option<u16>,
@@ -55,6 +57,14 @@ impl Url {
         // Drop credentials.
         let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
 
+        let keep_case = matches!(scheme.as_str(), "ipfs" | "ipns");
+        let fold = |host: &str| {
+            if keep_case {
+                host.to_string()
+            } else {
+                host.to_ascii_lowercase()
+            }
+        };
         let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
             // IPv6 literal: [::1]:8080
             let (h, after) = stripped.split_once(']')?;
@@ -63,10 +73,10 @@ impl Url {
         } else {
             match authority.rsplit_once(':') {
                 Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                    (h.to_ascii_lowercase(), p.parse().ok())
+                    (fold(h), p.parse().ok())
                 }
-                Some((h, "")) => (h.to_ascii_lowercase(), None),
-                _ => (authority.to_ascii_lowercase(), None),
+                Some((h, "")) => (fold(h), None),
+                _ => (fold(authority), None),
             }
         };
         let host = host.trim_end_matches('.').to_string();
@@ -454,6 +464,20 @@ mod tests {
 
     fn norm(s: &str) -> String {
         Url::parse(s).unwrap().normalized()
+    }
+
+    #[test]
+    fn content_ids_keep_their_case() {
+        let cid = "QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR";
+        assert_eq!(Url::parse(&format!("ipfs://{cid}/a")).unwrap().host, cid);
+        assert_eq!(
+            Url::parse("IPNS://12D3KooWExample/").unwrap().host,
+            "12D3KooWExample"
+        );
+        assert_eq!(
+            Url::parse("https://Example.COM/").unwrap().host,
+            "example.com"
+        );
     }
 
     #[test]
