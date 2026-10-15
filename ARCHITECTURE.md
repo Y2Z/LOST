@@ -255,7 +255,7 @@ Sources that aren't web pages are turned into pages at import time. A Hacker New
 |---|---|---|---|
 | `key` | string (indexed) | yes | `blake3(normalized URL)` (§6.5); one per document |
 | `url` | string | yes | The original URL, for display |
-| `url_text` | text (tokenized URL) | no | `inurl:`, `allinurl:` |
+| `url_text` | text (the URL's words, lowercase, and each punctuation mark as a token of its own: `gemini` `:` `/` `/` `capsule` `.` `example` …) | no | `inurl:`, `allinurl:` — so `inurl:gemini://` or `inurl:.onion/` match those characters, not just the words |
 | `host_rev` | string, multi-valued | no | `site:` — every level of the host, reversed (`com`, `com.example`, `com.example.www`), so `site:` is a single term lookup that includes subdomains |
 | `ext` | string | no | `ext:`, `filetype:` (from the URL path) |
 | `sources` | string, multi-valued | yes | `common_crawl`, `hacker_news`, … |
@@ -263,6 +263,8 @@ Sources that aren't web pages are turned into pages at import time. A Hacker New
 | `body` | text | yes | Plain text; `intext:`, snippets |
 | `links` | string, multi-valued | yes | Outgoing links; `link:` with a full URL |
 | `link_hosts` | string, multi-valued | no | Every level of every linked host, reversed (like `host_rev`); `link:` with a site |
+| `link_ext` | string, multi-valued | no | The file extensions of the links (`pdf`, `zip`, …); `contains:` |
+| `lang` | string | no | The page's language, an ISO 639-3 code (`deu`), detected from its title and the first 1,000 characters of its text when it's indexed (`whatlang`, 70 languages); none when the text is too short or too mixed to tell. Not stored with the page: it's worked out again whenever the index is built. `lang:` |
 | `crawled` | date | yes | When the page was captured |
 | `import_id` | u64, indexed | yes | The import this version of the page came from |
 
@@ -321,7 +323,7 @@ Merging only works if every source spells a URL the same way. The **key** is com
 
 Data written by one release of LOST must be readable by the next, or upgraded by it — never silently misread, and never thrown away without saying so.
 
-- **Search index.** `index/lost-index.json` records the index's **layout** (`INDEX_LAYOUT` in `engine.rs`: its fields and what goes in them, §6.2) and the LOST that last opened it: `{"layout": 1, "written_by": "LOST 0.2.0"}`. Every release that changes the layout raises the number and adds an upgrade step from the layout before (`engine::upgrade`), done in place where possible — adding a field, say — or by rebuilding the index: from the capture archive once there is one (§6.7), otherwise by importing again (the message says so). An index from a **newer** LOST isn't touched; LOST says to update. An index made before stamps existed counts as layout 1. Tantivy's own file format is Tantivy's to keep compatible: upgrading Tantivy across a format break counts as a layout change.
+- **Search index.** `index/lost-index.json` records the index's **layout** (`INDEX_LAYOUT` in `engine.rs`: its fields and what goes in them, §6.2) and the LOST that last opened it: `{"layout": 2, "written_by": "LOST 0.3.0"}`. Every release that changes the layout raises the number and adds an upgrade step from the layout before (`engine::upgrade`), done in place where possible, or by **rebuilding** the index from its stored fields, which hold all of every page (`url`, `title`, `body`, `links`, `sources`, `crawled`, `import_id`): everything else is worked out from them. A rebuild writes a new index next to the old one (`index.upgrading`, so it needs room for a second copy), holding the busy lock (§6.3), with progress on stderr, then swaps the folders (`index` → `index.old`, `index.upgrading` → `index`) and removes the old one; interrupted, it starts over next time, and an interrupted swap is undone when LOST opens. Layouts: **1** (LOST 0.1–0.2); **2** (0.3: URLs tokenized with their punctuation, `link_ext`, `lang`), rebuilt from 1. An index from a **newer** LOST isn't touched; LOST says to update. An index made before stamps existed counts as layout 1. Tantivy's own file format is Tantivy's to keep compatible: upgrading Tantivy across a format break counts as a layout change.
 - **App database.** redb tables are added, never repurposed: a new feature brings new tables (`captures`, say) and older ones stay as they are. A table whose rows have to change gets a new name, with an upgrade step that copies the rows over.
 - **`.lost` files** carry their format version in the first bytes and a schema version for the page records (§9.1). New page fields are optional, and readers skip fields they don't know, so a file from a newer LOST still imports into an older one, minus what's new.
 
@@ -380,7 +382,11 @@ Two modules, kept independent so either can be inspected, tested or replaced on 
 | `filetype:` / `ext:` | `filetype:pdf` | Term lookup on `ext` (case and a leading dot don't matter) | ✅ |
 | `link:` | `link:example.com`, `link:https://example.com/page` | A site (no path): pages linking anywhere on it, via `link_hosts`. A full URL: pages linking to exactly it, via `links`. Data from Common Crawl WAT files | ✅ |
 | `cache:` | `cache:https://example.com/page` | Not a search: the stored text of that one page (§7.6) | ✅ |
-| `related:` | `related:example.com` | More-like-this, seeded from that site's documents | later |
+| `related:` | `related:example.com`, `related:https://example.com/page` | Pages like that site's, on other sites: the 30 words that most set its pages apart (up to 20 of them, the first 16 KB of each; by how often they come up there and how rare they are elsewhere, as BM25 weighs them) are looked for, and a page needs a fifth of them (1–6). Words only those pages have, or that more than a tenth of all pages have, are left out. With a path: pages like that one page, which is left out. Matches nothing if the site or page isn't stored. Can be combined with the rest (`related:example.com lang:de`) | ✅ |
+| `contains:` | `contains:pdf` | Pages linking to files of that type (Bing's operator): a term lookup on `link_ext` | ✅ |
+| `lang:` / `language:` | `lang:de`, `language:german`, `-lang:en` | The page's detected language (`lang`). Takes ISO 639-1, 639-2 and 639-3 codes and English or native names (`de`, `deu`, `ger`, `German`, `Deutsch`); a language LOST can't tell matches nothing. Pages too short to tell have none, so they're left out of `lang:` and kept by `-lang:` | ✅ |
+| `near:` | `catfish near:3 cornmeal`, `"fried catfish" near:2 cornmeal` | Bing's operator: words or phrases at most N words apart (5 without a number, 100 at most), in either order, in the title or the text (or where `allintitle:` and the like say). Chained, `a near:2 b near:4 c`, all of them, as far apart as the widest says (in that order or reversed). A sloppy phrase query; phrases must also be found as written. Binds tighter than `OR` | ✅ |
+| `word*` | `catf*`, `intitle:catf*`, `"fried catf*"` | Words starting with what's before the `*` (at least 3 letters or digits): in each field, the 64 most common of them in the dictionary. In a phrase, only on the last word (Tantivy's phrase-prefix query, which takes the first 64 alphabetically). Shorter, it's just the word. Matches are highlighted | ✅ |
 
 An operator can be written apart from its value (`intitle: catfish`); one with no value at all is ignored.
 
@@ -401,7 +407,7 @@ Offline means no "what other people searched". Suggestions come from the data it
 
 - **Completing the word being typed:** a prefix scan of the title and text term dictionaries (FSTs, so it's fast), most common words first. When other words come before it, the 20 most common completions are re-ranked by how many pages contain them *together with* those words, and completions that never appear with them are dropped. So `rust comp` offers `rust compiler` before `rust company`.
 - **`_` as a wildcard**, like Google: `how to _ catfish` finds pages with `how to` and `catfish` one word apart (titles and text), and offers the words that actually fill the gap there, most frequent first.
-- Nothing is suggested once the last word is finished (followed by a space), or when it's an operator, an exclusion or a phrase.
+- Nothing is suggested once the last word is finished (followed by a space), or when it's an operator, an exclusion, a phrase or a `*` prefix.
 
 Available as `lost --suggest TEXT` (one suggestion per line), and in step 4 as `/api/suggest` for the web UI and the GUI.
 
@@ -769,6 +775,7 @@ lost/
     ├── record.rs             records, documents, merge rules (§6.4)
     ├── query.rs              search syntax parser
     ├── engine.rs             search engine (Tantivy)
+    ├── lang.rs               pages' languages (whatlang), lang: names and codes
     ├── store.rs              app database (redb)
     ├── lostfile.rs           .lost format reader / writer
     ├── datasources.rs        data source detection and shared helpers

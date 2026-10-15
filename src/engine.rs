@@ -11,13 +11,19 @@ use std::time::Instant;
 use serde::Serialize;
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery};
-use tantivy::schema::{Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TEXT, Value};
+use tantivy::query::{
+    BooleanQuery, BoostQuery, EmptyQuery, EnableScoring, Explanation, Occur, PhrasePrefixQuery,
+    PhraseQuery, Query, QueryClone, Scorer, TermQuery, Weight,
+};
+use tantivy::schema::{
+    Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing,
+    TextOptions, Value,
+};
 use tantivy::snippet::SnippetGenerator;
-use tantivy::tokenizer::{TextAnalyzer, TokenStream};
+use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
 use tantivy::{
-    DateTime, DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument,
-    Term,
+    DateTime, DocAddress, DocId, DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, Score,
+    Searcher, SegmentReader, TantivyDocument, Term,
 };
 
 use crate::Result;
@@ -32,7 +38,11 @@ pub const INDEX_DIR: &str = "index";
 /// The layout of the index: its fields and what goes in them (ARCHITECTURE.md
 /// §6.2). Raised whenever that changes, with a step in [`upgrade`] that
 /// brings an index of the layout before up to date.
-pub const INDEX_LAYOUT: u32 = 1;
+///
+/// - 1: LOST 0.1–0.2.
+/// - 2: URLs tokenized with their punctuation (`inurl:gemini://`), links'
+///   file extensions (`contains:`), pages' languages (`lang:`).
+pub const INDEX_LAYOUT: u32 = 2;
 /// In the index folder: the layout it has, and the LOST that last opened it.
 const STAMP_FILE: &str = "lost-index.json";
 
@@ -68,6 +78,23 @@ const MAX_SUGGEST_TEXT: usize = 64 * 1024;
 /// Most combinations of `*` gap sizes tried for one phrase.
 const MAX_WILDCARD_LAYOUTS: usize = 9;
 
+/// `catf*`: the most words it stands for (the most common ones), and the
+/// most dictionary words looked at per field and segment to find them.
+const MAX_PREFIX_TERMS: usize = 64;
+const MAX_PREFIX_SCAN: usize = 200_000;
+
+/// `related:`: pages of a site read to learn what it's about, how much of
+/// each page's text, and how many of its most telling words are looked for.
+const RELATED_SEEDS: usize = 20;
+const RELATED_TEXT: usize = 16 * 1024;
+const RELATED_TERMS: usize = 30;
+
+/// The tokenizer of `url_text`: words and every punctuation mark on its own
+/// (ARCHITECTURE.md §6.2), so `inurl:gemini://` means just that.
+const URL_TOKENIZER: &str = "url";
+/// URL words longer than this (hashes, base64…) aren't indexed.
+const MAX_URL_WORD: usize = 64;
+
 /// Snippet length, in characters.
 const SNIPPET_CHARS: usize = 240;
 
@@ -88,8 +115,89 @@ struct Fields {
     body: Field,
     links: Field,
     link_hosts: Field,
+    link_ext: Field,
+    lang: Field,
     crawled: Field,
     import_id: Field,
+}
+
+impl Fields {
+    fn stored(&self) -> Stored {
+        Stored {
+            key: self.key,
+            url: self.url,
+            sources: self.sources,
+            title: self.title,
+            body: self.body,
+            links: self.links,
+            crawled: self.crawled,
+            import_id: self.import_id,
+        }
+    }
+}
+
+/// The stored fields, which hold everything a page is: what an index of
+/// any layout is rebuilt from.
+#[derive(Clone, Copy)]
+struct Stored {
+    key: Field,
+    url: Field,
+    sources: Field,
+    title: Field,
+    body: Field,
+    links: Field,
+    crawled: Field,
+    import_id: Field,
+}
+
+impl Stored {
+    /// The stored fields of an index, found by name (so in an index of an
+    /// older layout too).
+    fn of(schema: &Schema) -> Result<Stored> {
+        let field = |name: &str| {
+            schema
+                .get_field(name)
+                .map_err(|_| format!("the search index has no {name} field"))
+        };
+        Ok(Stored {
+            key: field("key")?,
+            url: field("url")?,
+            sources: field("sources")?,
+            title: field("title")?,
+            body: field("body")?,
+            links: field("links")?,
+            crawled: field("crawled")?,
+            import_id: field("import_id")?,
+        })
+    }
+
+    fn decode(&self, d: &TantivyDocument) -> Doc {
+        let text = |field: Field| -> Option<String> {
+            d.get_first(field)
+                .and_then(|v| v.as_str().map(str::to_string))
+        };
+        let number = |field: Field| -> Option<u64> { d.get_first(field).and_then(|v| v.as_u64()) };
+        let date = |field: Field| -> Option<i64> {
+            d.get_first(field)
+                .and_then(|v| v.as_datetime())
+                .map(|t| t.into_timestamp_secs())
+        };
+        let all = |field: Field| -> Vec<String> {
+            d.get_all(field)
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        Doc {
+            key: text(self.key).unwrap_or_default(),
+            url: text(self.url).unwrap_or_default(),
+            sources: all(self.sources),
+            title: text(self.title),
+            body: text(self.body).unwrap_or_default(),
+            links: all(self.links),
+            crawled: date(self.crawled),
+            import_id: number(self.import_id).unwrap_or(0),
+        }
+    }
 }
 
 fn schema() -> (Schema, Fields) {
@@ -97,7 +205,14 @@ fn schema() -> (Schema, Fields) {
     let fields = Fields {
         key: b.add_text_field("key", STRING | STORED),
         url: b.add_text_field("url", STORED),
-        url_text: b.add_text_field("url_text", TEXT),
+        url_text: b.add_text_field(
+            "url_text",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(URL_TOKENIZER)
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        ),
         host_rev: b.add_text_field("host_rev", STRING),
         ext: b.add_text_field("ext", STRING),
         sources: b.add_text_field("sources", STRING | STORED),
@@ -105,6 +220,8 @@ fn schema() -> (Schema, Fields) {
         body: b.add_text_field("body", TEXT | STORED),
         links: b.add_text_field("links", STRING | STORED),
         link_hosts: b.add_text_field("link_hosts", STRING),
+        link_ext: b.add_text_field("link_ext", STRING),
+        lang: b.add_text_field("lang", STRING),
         crawled: b.add_date_field("crawled", STORED),
         import_id: b.add_u64_field("import_id", INDEXED | STORED),
     };
@@ -143,15 +260,19 @@ fn check_layout(dir: &Path) -> Result<()> {
     while now < INDEX_LAYOUT {
         now = upgrade(dir, now)?;
     }
+    write_stamp(dir, now)
+}
+
+/// Stamps the index in `dir` with `layout`, and this LOST as the last to
+/// open it (unless it says that already).
+fn write_stamp(dir: &Path, layout: u32) -> Result<()> {
+    let path = dir.join(STAMP_FILE);
     let written_by = format!("LOST {}", env!("CARGO_PKG_VERSION"));
     let current = std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice::<Stamp>(&b).ok());
-    if current.is_none_or(|s| s.layout != now || s.written_by != written_by) {
-        let stamp = serde_json::to_vec_pretty(&Stamp {
-            layout: now,
-            written_by,
-        })?;
+    if current.is_none_or(|s| s.layout != layout || s.written_by != written_by) {
+        let stamp = serde_json::to_vec_pretty(&Stamp { layout, written_by })?;
         let partial = dir.join(format!("{STAMP_FILE}.part"));
         std::fs::write(&partial, stamp)
             .and_then(|()| std::fs::rename(&partial, &path))
@@ -160,17 +281,270 @@ fn check_layout(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Brings an index of layout `from` to the next layout, returning it. Each
-/// layout change adds its step here: done in place where it can be, or by
-/// rebuilding the index — from the capture archive once there is one
-/// (§6.7), otherwise by importing again. There are none yet.
+/// Brings an index of layout `from` up to date, returning the layout it has
+/// now. Each layout change adds its step here: done in place where it can
+/// be, or by rebuilding the index from its stored fields.
 fn upgrade(dir: &Path, from: u32) -> Result<u32> {
-    Err(format!(
-        "the search index in {} was made by an older version of LOST (layout {from}) \
-         and can't be upgraded; remove it and import your datasets again",
-        dir.display()
-    )
-    .into())
+    match from {
+        // Layout 2 changes only what's worked out from the stored fields.
+        1 => {
+            rebuild(dir)?;
+            Ok(INDEX_LAYOUT)
+        }
+        _ => Err(format!(
+            "the search index in {} has a layout this LOST doesn't know ({from}); \
+             remove it and import your datasets again",
+            dir.display()
+        )
+        .into()),
+    }
+}
+
+/// `index.old`, `index.upgrading`: folders next to the index's.
+fn sibling(dir: &Path, what: &str) -> std::path::PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| INDEX_DIR.to_string());
+    dir.with_file_name(format!("{name}.{what}"))
+}
+
+/// After an upgrade was interrupted while swapping folders: the index is
+/// put back (it'll be upgraded again), or what's left of the old one goes.
+fn recover(dir: &Path) -> Result<()> {
+    let previous = sibling(dir, "old");
+    if !previous.exists() {
+        return Ok(());
+    }
+    if dir.exists() {
+        std::fs::remove_dir_all(&previous)
+            .map_err(|e| format!("can't remove {}: {e}", previous.display()))?;
+    } else {
+        std::fs::rename(&previous, dir)
+            .map_err(|e| format!("can't move {} back: {e}", previous.display()))?;
+    }
+    Ok(())
+}
+
+/// Builds the index in `dir` again, in the current layout, from what it
+/// stores — every page is all there — next to it in `index.upgrading`,
+/// then puts it in its place. Needs room for a second copy while it runs.
+/// The busy lock keeps imports and other upgrades out meanwhile.
+fn rebuild(dir: &Path) -> Result<()> {
+    let data_dir = dir.parent().unwrap_or(dir);
+    let _busy = crate::store::BusyLock::acquire(data_dir, "upgrade of the search index")?;
+    let fresh = sibling(dir, "upgrading");
+    let previous = sibling(dir, "old");
+    let _ = std::fs::remove_dir_all(&fresh);
+    std::fs::create_dir_all(&fresh)
+        .map_err(|e| format!("can't create {}: {e}", fresh.display()))?;
+
+    {
+        let old = Index::open(MmapDirectory::open(dir)?)
+            .map_err(|e| format!("can't open the index in {}: {e}", dir.display()))?;
+        let stored = Stored::of(&old.schema())?;
+        // Read once, with nothing watching the folder: it's moved afterwards.
+        let reader: IndexReader = old
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let searcher = reader.searcher();
+        let total = searcher.num_docs();
+
+        let (schema, f) = schema();
+        let index = Index::create_in_dir(&fresh, schema)
+            .map_err(|e| format!("can't create an index in {}: {e}", fresh.display()))?;
+        register_tokenizers(&index);
+        let threads = writer_threads();
+        let mut writer: IndexWriter =
+            index.writer_with_num_threads(threads, threads * 50_000_000)?;
+
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let report = |done: u64| {
+            let line = format!(
+                "Upgrading the search index for LOST {}: {} of {} pages…",
+                env!("CARGO_PKG_VERSION"),
+                crate::text::thousands(done),
+                crate::text::thousands(total)
+            );
+            if interactive {
+                eprint!("\r{line}");
+            } else if done == 0 || done == total {
+                eprintln!("{line}");
+            }
+        };
+        report(0);
+        let mut batch: Vec<Doc> = Vec::with_capacity(BATCH_SIZE);
+        let mut done = 0;
+        for (ord, segment) in searcher.segment_readers().iter().enumerate() {
+            for id in segment.doc_ids_alive() {
+                let td: TantivyDocument = searcher.doc(DocAddress::new(ord as u32, id))?;
+                batch.push(stored.decode(&td));
+                if batch.len() >= BATCH_SIZE {
+                    done += write_docs(&writer, &f, &mut batch)?;
+                    report(done);
+                }
+            }
+        }
+        done += write_docs(&writer, &f, &mut batch)?;
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+        report(done);
+        if interactive {
+            eprintln!();
+        }
+        write_stamp(&fresh, INDEX_LAYOUT)?;
+    }
+
+    std::fs::rename(dir, &previous)
+        .map_err(|e| format!("can't move {} aside: {e}", dir.display()))?;
+    std::fs::rename(&fresh, dir).map_err(|e| {
+        let _ = std::fs::rename(&previous, dir);
+        format!("can't put the upgraded index in {}: {e}", dir.display())
+    })?;
+    std::fs::remove_dir_all(&previous)
+        .map_err(|e| format!("can't remove {}: {e}", previous.display()))?;
+    Ok(())
+}
+
+/// Indexing threads: as many as there are cores, up to 4.
+fn writer_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 4)
+}
+
+/// Adds `docs` (emptying it) to the index, and returns how many.
+fn write_docs(writer: &IndexWriter, f: &Fields, docs: &mut Vec<Doc>) -> Result<u64> {
+    let languages = detect_languages(docs);
+    let count = docs.len() as u64;
+    for (doc, lang) in docs.drain(..).zip(languages) {
+        writer.add_document(encode(f, &doc, lang))?;
+    }
+    Ok(count)
+}
+
+/// The language of each page (ARCHITECTURE.md §7.1), worked out on every
+/// core: it's most of the work of indexing a page.
+fn detect_languages(docs: &[Doc]) -> Vec<Option<&'static str>> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    if docs.len() < 64 || threads == 1 {
+        return docs
+            .iter()
+            .map(|d| crate::lang::detect(d.title.as_deref(), &d.body))
+            .collect();
+    }
+    let size = docs.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = docs
+            .chunks(size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|d| crate::lang::detect(d.title.as_deref(), &d.body))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// Registers the tokenizers the schema names, besides Tantivy's own.
+fn register_tokenizers(index: &Index) {
+    index.tokenizers().register(URL_TOKENIZER, UrlTokenizer);
+}
+
+/// A URL's words (letters and digits, lowercase) and each punctuation mark
+/// on its own, with their byte offsets and positions: `gemini://a.b/c` is
+/// `gemini` `:` `/` `/` `a` `.` `b` `/` `c`. A word longer than
+/// [`MAX_URL_WORD`] bytes is left out, leaving a gap.
+fn url_tokens(text: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((from, c)) = chars.next() {
+        let to = if c.is_alphanumeric() {
+            let mut to = from + c.len_utf8();
+            while let Some(&(at, next)) = chars.peek() {
+                if !next.is_alphanumeric() {
+                    break;
+                }
+                to = at + next.len_utf8();
+                chars.next();
+            }
+            to
+        } else if c.is_whitespace() {
+            continue;
+        } else {
+            from + c.len_utf8()
+        };
+        if to - from <= MAX_URL_WORD {
+            tokens.push(Token {
+                offset_from: from,
+                offset_to: to,
+                position,
+                text: text[from..to].to_lowercase(),
+                position_length: 1,
+            });
+        }
+        position += 1;
+    }
+    tokens
+}
+
+#[derive(Clone)]
+struct UrlTokenizer;
+
+struct UrlTokenStream {
+    tokens: Vec<Token>,
+    /// The token `token()` gives, plus one: none before the first `advance`.
+    next: usize,
+    empty: Token,
+}
+
+impl Tokenizer for UrlTokenizer {
+    type TokenStream<'a> = UrlTokenStream;
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> UrlTokenStream {
+        UrlTokenStream {
+            tokens: url_tokens(text),
+            next: 0,
+            empty: Token::default(),
+        }
+    }
+}
+
+impl TokenStream for UrlTokenStream {
+    fn advance(&mut self) -> bool {
+        if self.next < self.tokens.len() {
+            self.next += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn token(&self) -> &Token {
+        match self.next.checked_sub(1) {
+            Some(at) => &self.tokens[at],
+            None => &self.empty,
+        }
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        match self.next.checked_sub(1) {
+            Some(at) => &mut self.tokens[at],
+            None => &mut self.empty,
+        }
+    }
 }
 
 /// One search result.
@@ -231,12 +605,14 @@ impl Engine {
     /// Opens the index in `data_dir`, creating it if it doesn't exist.
     pub fn open(data_dir: &Path) -> Result<Engine> {
         let dir = data_dir.join(INDEX_DIR);
+        recover(&dir)?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("can't create {}: {e}", dir.display()))?;
         check_layout(&dir)?;
         let (schema, f) = schema();
         let index = Index::open_or_create(MmapDirectory::open(&dir)?, schema)
             .map_err(|e| format!("can't open the index in {}: {e}", dir.display()))?;
+        register_tokenizers(&index);
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -296,25 +672,15 @@ impl Engine {
             snippets.set_max_num_chars(SNIPPET_CHARS);
 
             // The index terms of every word and phrase that isn't excluded.
+            let marks = self.marks(node.as_ref())?;
             let mut analyzer = self.index.tokenizer_for_field(self.f.body)?;
-            let terms: HashSet<String> = node
-                .as_ref()
-                .map(query::positive_terms)
-                .unwrap_or_default()
-                .iter()
-                .flat_map(|t| {
-                    tokenize(&mut analyzer, t)
-                        .into_iter()
-                        .map(|(text, _, _)| text)
-                })
-                .collect();
             let mut word_ranges = |text: &str| -> Vec<(usize, usize)> {
-                if terms.is_empty() {
+                if marks.is_empty() {
                     return Vec::new();
                 }
                 tokenize(&mut analyzer, text)
                     .into_iter()
-                    .filter(|(token, _, _)| terms.contains(token))
+                    .filter(|(token, _, _)| marks.matches(token))
                     .map(|(_, from, to)| (from, to))
                     .collect()
             };
@@ -379,6 +745,7 @@ impl Engine {
             || last.contains(':')
             || last.starts_with('-')
             || last.contains('"')
+            || last.ends_with('*')
         {
             return Ok(Vec::new());
         }
@@ -536,24 +903,15 @@ impl Engine {
             return Ok(None);
         };
 
-        let terms: HashSet<String> = highlight
-            .and_then(query::parse)
-            .map(|node| query::positive_terms(&node))
-            .unwrap_or_default()
-            .iter()
-            .map(|t| self.tokens(t))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        let marks = self.marks(highlight.and_then(query::parse).as_ref())?;
         let mut analyzer = self.index.tokenizer_for_field(self.f.body)?;
         let mut matches = |text: &str| -> Vec<[usize; 2]> {
-            if terms.is_empty() {
+            if marks.is_empty() {
                 return Vec::new();
             }
             let bytes: Vec<(usize, usize)> = tokenize(&mut analyzer, text)
                 .into_iter()
-                .filter(|(token, _, _)| terms.contains(token))
+                .filter(|(token, _, _)| marks.matches(token))
                 .map(|(_, from, to)| (from, to))
                 .collect();
             char_ranges(text, &bytes)
@@ -661,10 +1019,7 @@ impl Engine {
     /// Starts adding documents. Only one indexer may exist at a time, across
     /// all processes; the busy lock (store.rs) makes sure of that.
     pub fn indexer(&self) -> Result<Indexer<'_>> {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 4);
+        let threads = writer_threads();
         let writer = self
             .index
             .writer_with_num_threads(threads, threads * 50_000_000)?;
@@ -710,6 +1065,18 @@ impl Engine {
                 Some(LinkTarget::Host) => site_term(target).map(|t| term(self.f.link_hosts, &t)),
                 None => None,
             },
+            Node::Near {
+                parts,
+                distance,
+                scope,
+            } => self.near_query(parts, *distance, *scope)?,
+            Node::Contains(ext) => (!ext.is_empty()).then(|| term(self.f.link_ext, ext)),
+            Node::Related(target) => self.related_query(target)?,
+            // A language LOST can't tell matches nothing.
+            Node::Lang(name) => Some(match crate::lang::code(name) {
+                Some(code) => term(self.f.lang, code),
+                None => Box::new(EmptyQuery) as Box<dyn Query>,
+            }),
             // An exclusion on its own (e.g. in an OR) asks for nothing.
             Node::Not(_) => None,
             Node::And(children) => {
@@ -718,7 +1085,7 @@ impl Engine {
                     match child {
                         Node::Not(inner) => {
                             if let Some(q) = self.build(inner, fields)? {
-                                clauses.push((Occur::MustNot, q));
+                                clauses.push((Occur::MustNot, Box::new(Excluded(q))));
                             }
                         }
                         other => {
@@ -750,12 +1117,42 @@ impl Engine {
 
     /// A word or phrase searched in the given fields. Text that tokenizes into
     /// several words ("e-mail", "fried catfish") is matched as a phrase; a `*`
-    /// in a phrase stands for one to three missing words.
+    /// in a phrase stands for one to three missing words, and one at the end
+    /// of the last word (`catf*`) for the rest of it.
     fn text_query(&self, text: &str, fields: &[(Field, f32)]) -> Result<Option<Box<dyn Query>>> {
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for &(field, boost) in fields {
+            if let Some(q) = self.field_text_query(text, field)? {
+                clauses.push((Occur::Should, Box::new(BoostQuery::new(q, boost))));
+            }
+        }
+        Ok((!clauses.is_empty()).then(|| Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>))
+    }
+
+    /// [`Engine::text_query`] in one field, tokenized as that field is
+    /// (URLs keep their punctuation). `None` if nothing in `text` is a word
+    /// there.
+    fn field_text_query(&self, text: &str, field: Field) -> Result<Option<Box<dyn Query>>> {
+        let mut analyzer = self.index.tokenizer_for_field(field)?;
+        let pieces = query::wildcard_chunks(text);
+        let last_piece = pieces.len().saturating_sub(1);
         // Each chunk's terms, and the number of `*` before it.
         let mut chunks: Vec<(usize, Vec<String>)> = Vec::new();
-        for (stars, chunk) in query::wildcard_chunks(text) {
-            let tokens = self.tokens(&chunk)?;
+        // Whether the last term is a prefix (`catf*`).
+        let mut prefix = false;
+        for (i, (stars, chunk)) in pieces.into_iter().enumerate() {
+            let words: Vec<&str> = chunk.split_whitespace().collect();
+            let mut tokens = Vec::new();
+            for (j, word) in words.iter().enumerate() {
+                let last = i == last_piece && j + 1 == words.len();
+                let (piece, is_prefix) = match query::prefix(word) {
+                    Some(stem) => (stem, last),
+                    None => (word.trim_end_matches('*'), false),
+                };
+                let found = tokens_of(&mut analyzer, piece);
+                prefix = is_prefix && !found.is_empty();
+                tokens.extend(found);
+            }
             if tokens.is_empty() {
                 continue;
             }
@@ -768,37 +1165,279 @@ impl Engine {
         let gaps: Vec<usize> = chunks.iter().skip(1).map(|(stars, _)| *stars).collect();
         let layouts = query::gap_layouts(&gaps, MAX_WILDCARD_LAYOUTS);
 
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for &(field, boost) in fields {
-            for layout in &layouts {
-                // Term positions: consecutive within a chunk, with a gap before each later chunk.
-                let mut terms = Vec::new();
-                let mut position = 0;
-                for (i, (_, tokens)) in chunks.iter().enumerate() {
-                    if i > 0 {
-                        position += layout[i - 1];
-                    }
-                    for token in tokens {
-                        terms.push((position, Term::from_field_text(field, token)));
-                        position += 1;
-                    }
+        let mut alternatives: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for layout in &layouts {
+            // Term positions: consecutive within a chunk, with a gap before each later chunk.
+            let mut terms = Vec::new();
+            let mut position = 0;
+            for (i, (_, tokens)) in chunks.iter().enumerate() {
+                if i > 0 {
+                    position += layout[i - 1];
                 }
-                let q: Box<dyn Query> = if terms.len() == 1 {
-                    Box::new(TermQuery::new(
-                        terms.remove(0).1,
-                        IndexRecordOption::WithFreqs,
-                    ))
-                } else if layout.iter().all(|&g| g == 0) {
-                    Box::new(PhraseQuery::new(
-                        terms.into_iter().map(|(_, t)| t).collect(),
-                    ))
-                } else {
-                    Box::new(PhraseQuery::new_with_offset(terms))
-                };
+                for token in tokens {
+                    terms.push((position, Term::from_field_text(field, token)));
+                    position += 1;
+                }
+            }
+            let q: Box<dyn Query> = if prefix && terms.len() == 1 {
+                let last = chunks.last().and_then(|(_, t)| t.last()).cloned();
+                self.prefix_query(field, &last.unwrap_or_default())?
+            } else if prefix {
+                let mut q = PhrasePrefixQuery::new_with_offset(terms);
+                q.set_max_expansions(MAX_PREFIX_TERMS as u32);
+                Box::new(q)
+            } else if terms.len() == 1 {
+                Box::new(TermQuery::new(
+                    terms.remove(0).1,
+                    IndexRecordOption::WithFreqs,
+                ))
+            } else if layout.iter().all(|&g| g == 0) {
+                Box::new(PhraseQuery::new(
+                    terms.into_iter().map(|(_, t)| t).collect(),
+                ))
+            } else {
+                Box::new(PhraseQuery::new_with_offset(terms))
+            };
+            alternatives.push((Occur::Should, q));
+        }
+        Ok(Some(if alternatives.len() == 1 {
+            alternatives.remove(0).1
+        } else {
+            Box::new(BooleanQuery::new(alternatives))
+        }))
+    }
+
+    /// `catf*` in one field: its [`MAX_PREFIX_TERMS`] most common words
+    /// starting with `prefix`. Matches nothing if there are none.
+    fn prefix_query(&self, field: Field, prefix: &str) -> Result<Box<dyn Query>> {
+        let searcher = self.reader.searcher();
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for segment in searcher.segment_readers() {
+            let index = segment.inverted_index(field)?;
+            let mut stream = index.terms().range().ge(prefix.as_bytes()).into_stream()?;
+            let mut seen = 0;
+            while stream.advance() && seen < MAX_PREFIX_SCAN {
+                let key = stream.key();
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                seen += 1;
+                if let Ok(word) = std::str::from_utf8(key) {
+                    *counts.entry(word.to_string()).or_default() +=
+                        u64::from(stream.value().doc_freq);
+                }
+            }
+        }
+        let mut words: Vec<(String, u64)> = counts.into_iter().collect();
+        words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        words.truncate(MAX_PREFIX_TERMS);
+        if words.is_empty() {
+            return Ok(Box::new(EmptyQuery));
+        }
+        let clauses = words
+            .into_iter()
+            .map(|(word, _)| {
+                let q: Box<dyn Query> = Box::new(TermQuery::new(
+                    Term::from_field_text(field, &word),
+                    IndexRecordOption::WithFreqs,
+                ));
+                (Occur::Should, q)
+            })
+            .collect();
+        Ok(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    /// `catfish near:3 cornmeal`: the words (or phrases) at most `distance`
+    /// words apart, in either order, in the title or the text (or where
+    /// `scope` says). Phrases must also be found as they're written.
+    fn near_query(
+        &self,
+        parts: &[String],
+        distance: u32,
+        scope: Option<Scope>,
+    ) -> Result<Option<Box<dyn Query>>> {
+        let fields = match scope {
+            Some(scope) => self.text_fields(Some(scope)),
+            None => vec![(self.f.title, BOOST_TITLE), (self.f.body, BOOST_BODY)],
+        };
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for (field, boost) in fields {
+            let mut analyzer = self.index.tokenizer_for_field(field)?;
+            // Each part's terms (stars mean nothing here).
+            let tokenized: Vec<(&String, Vec<String>)> = parts
+                .iter()
+                .map(|part| (part, tokens_of(&mut analyzer, &part.replace('*', " "))))
+                .filter(|(_, tokens)| !tokens.is_empty())
+                .collect();
+            let q: Option<Box<dyn Query>> = match tokenized.as_slice() {
+                [] => None,
+                // Nothing to be near: just the one part.
+                [(part, _)] => self.field_text_query(part, field)?,
+                _ => {
+                    let phrase = |order: Vec<&Vec<String>>| -> Box<dyn Query> {
+                        let terms: Vec<(usize, Term)> = order
+                            .into_iter()
+                            .flatten()
+                            .enumerate()
+                            .map(|(i, word)| (i, Term::from_field_text(field, word)))
+                            .collect();
+                        Box::new(PhraseQuery::new_with_offset_and_slop(terms, distance))
+                    };
+                    let forward = phrase(tokenized.iter().map(|(_, t)| t).collect());
+                    let backward = phrase(tokenized.iter().rev().map(|(_, t)| t).collect());
+                    let mut must: Vec<(Occur, Box<dyn Query>)> = vec![(
+                        Occur::Must,
+                        Box::new(BooleanQuery::new(vec![
+                            (Occur::Should, forward),
+                            (Occur::Should, backward),
+                        ])),
+                    )];
+                    for (_, tokens) in &tokenized {
+                        if tokens.len() > 1 {
+                            let terms = tokens
+                                .iter()
+                                .map(|word| Term::from_field_text(field, word))
+                                .collect();
+                            must.push((Occur::Must, Box::new(PhraseQuery::new(terms))));
+                        }
+                    }
+                    Some(Box::new(BooleanQuery::new(must)))
+                }
+            };
+            if let Some(q) = q {
                 clauses.push((Occur::Should, Box::new(BoostQuery::new(q, boost))));
             }
         }
-        Ok(Some(Box::new(BooleanQuery::new(clauses))))
+        Ok((!clauses.is_empty()).then(|| Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>))
+    }
+
+    /// `related:example.com`: pages that use the words that most set the
+    /// site's pages apart, on other sites. `related:URL` (with a path): pages
+    /// like that one page. Matches nothing if the site or page isn't stored.
+    fn related_query(&self, target: &str) -> Result<Option<Box<dyn Query>>> {
+        let searcher = self.reader.searcher();
+        let nothing = || Ok(Some(Box::new(EmptyQuery) as Box<dyn Query>));
+        let target = target.trim();
+        let as_url = if target.contains("://") {
+            target.to_string()
+        } else {
+            format!("https://{target}")
+        };
+        let page = Url::parse(&as_url).filter(|u| u.path != "/" || u.query.is_some());
+        let (seeds, exclude): (Vec<Doc>, Box<dyn Query>) = match page {
+            Some(_) => {
+                let Some(key) = crate::record::url_key(&as_url) else {
+                    return nothing();
+                };
+                let Some(doc) = self.load(&searcher, &key)? else {
+                    return nothing();
+                };
+                let this = TermQuery::new(
+                    Term::from_field_text(self.f.key, &key),
+                    IndexRecordOption::Basic,
+                );
+                (vec![doc], Box::new(this))
+            }
+            None => {
+                let Some(site) = site_term(target) else {
+                    return Ok(None);
+                };
+                let on_site = TermQuery::new(
+                    Term::from_field_text(self.f.host_rev, &site),
+                    IndexRecordOption::Basic,
+                );
+                let top = searcher.search(
+                    &on_site,
+                    &TopDocs::with_limit(RELATED_SEEDS).order_by_score(),
+                )?;
+                let mut docs = Vec::new();
+                for (_, address) in top {
+                    docs.push(self.decode(&searcher.doc::<TantivyDocument>(address)?));
+                }
+                (docs, Box::new(on_site))
+            }
+        };
+        if seeds.is_empty() {
+            return nothing();
+        }
+
+        // How often each word comes up in the seeds' titles and texts.
+        let mut analyzer = self.index.tokenizer_for_field(self.f.body)?;
+        let mut counts: HashMap<(Field, String), u32> = HashMap::new();
+        for doc in &seeds {
+            let texts = [
+                (self.f.title, doc.title.as_deref().unwrap_or("")),
+                (self.f.body, truncate_at_word(&doc.body, RELATED_TEXT)),
+            ];
+            for (field, text) in texts {
+                for word in tokens_of(&mut analyzer, text) {
+                    let telling =
+                        word.chars().count() >= 3 && !word.chars().all(|c| c.is_numeric());
+                    if telling {
+                        *counts.entry((field, word)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        // Weighed by how rare they are elsewhere (as BM25's IDF does). Words
+        // only the seeds have can't find anything else; words on more than a
+        // tenth of all pages (in a database big enough to say) tell nothing.
+        let total = searcher.num_docs() as f32;
+        let mut scored: Vec<(Field, String, f32)> = Vec::new();
+        for ((field, word), count) in counts {
+            let doc_freq = searcher.doc_freq(&Term::from_field_text(field, &word))? as f32;
+            if doc_freq <= seeds.len() as f32 || (total >= 1000.0 && doc_freq * 10.0 > total) {
+                continue;
+            }
+            let idf = ((total - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0).ln();
+            scored.push((field, word, count as f32 * idf));
+        }
+        scored.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+        scored.truncate(RELATED_TERMS);
+        let Some(best) = scored.first().map(|(_, _, score)| *score) else {
+            return nothing();
+        };
+        let clauses: Vec<(Occur, Box<dyn Query>)> = scored
+            .iter()
+            .map(|(field, word, score)| {
+                let term = TermQuery::new(
+                    Term::from_field_text(*field, word),
+                    IndexRecordOption::WithFreqs,
+                );
+                let q: Box<dyn Query> = Box::new(BoostQuery::new(Box::new(term), score / best));
+                (Occur::Should, q)
+            })
+            .collect();
+        // A page has to share a few of those words, not just one.
+        let required = (clauses.len() / 5).clamp(1, 6);
+        let similar = BooleanQuery::with_minimum_required_clauses(clauses, required);
+        Ok(Some(Box::new(BooleanQuery::new(vec![
+            (Occur::Must, Box::new(similar)),
+            (Occur::MustNot, exclude),
+        ]))))
+    }
+
+    /// What to mark in titles and snippets: the index terms of every word and
+    /// phrase of `node` that isn't excluded, and the beginnings of words
+    /// that `catf*` stands for.
+    fn marks(&self, node: Option<&Node>) -> Result<Marks> {
+        let mut marks = Marks::default();
+        let mut analyzer = self.index.tokenizer_for_field(self.f.body)?;
+        for text in node.map(query::positive_terms).unwrap_or_default() {
+            for word in text.split_whitespace() {
+                match query::prefix(word) {
+                    Some(stem) => {
+                        let mut tokens = tokens_of(&mut analyzer, stem);
+                        if let Some(last) = tokens.pop() {
+                            marks.prefixes.push(last);
+                        }
+                        marks.words.extend(tokens);
+                    }
+                    None => marks.words.extend(tokens_of(&mut analyzer, word)),
+                }
+            }
+        }
+        Ok(marks)
     }
 
     /// Splits text into index terms, the same way the text fields were indexed.
@@ -827,72 +1466,145 @@ impl Engine {
         }
     }
 
-    fn encode(&self, doc: &Doc) -> TantivyDocument {
-        let f = &self.f;
-        let mut d = TantivyDocument::default();
-        d.add_text(f.key, &doc.key);
-        d.add_text(f.url, &doc.url);
-        d.add_text(f.url_text, &doc.url);
-        if let Some(url) = Url::parse(&doc.url) {
-            for suffix in url.host_suffixes() {
-                d.add_text(f.host_rev, &suffix);
-            }
-            if let Some(ext) = url.extension() {
-                d.add_text(f.ext, &ext);
-            }
-        }
-        for source in &doc.sources {
-            d.add_text(f.sources, source);
-        }
-        if let Some(title) = &doc.title {
-            d.add_text(f.title, title);
-        }
-        d.add_text(f.body, &doc.body);
-        let mut hosts = HashSet::new();
-        for link in &doc.links {
-            d.add_text(f.links, link);
-            if let Some(url) = Url::parse(link) {
-                hosts.extend(url.host_suffixes());
-            }
-        }
-        for host in hosts {
-            d.add_text(f.link_hosts, &host);
-        }
-        if let Some(crawled) = doc.crawled {
-            d.add_date(f.crawled, DateTime::from_timestamp_secs(crawled));
-        }
-        d.add_u64(f.import_id, doc.import_id);
-        d
+    fn decode(&self, d: &TantivyDocument) -> Doc {
+        self.f.stored().decode(d)
+    }
+}
+
+/// What to mark in a result: [`Engine::marks`].
+#[derive(Default)]
+struct Marks {
+    words: HashSet<String>,
+    prefixes: Vec<String>,
+}
+
+impl Marks {
+    fn is_empty(&self) -> bool {
+        self.words.is_empty() && self.prefixes.is_empty()
     }
 
-    fn decode(&self, d: &TantivyDocument) -> Doc {
-        let f = &self.f;
-        let text = |field: Field| -> Option<String> {
-            d.get_first(field)
-                .and_then(|v| v.as_str().map(str::to_string))
-        };
-        let number = |field: Field| -> Option<u64> { d.get_first(field).and_then(|v| v.as_u64()) };
-        let date = |field: Field| -> Option<i64> {
-            d.get_first(field)
-                .and_then(|v| v.as_datetime())
-                .map(|t| t.into_timestamp_secs())
-        };
-        let all = |field: Field| -> Vec<String> {
-            d.get_all(field)
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        };
+    fn matches(&self, token: &str) -> bool {
+        self.words.contains(token) || self.prefixes.iter().any(|p| token.starts_with(p.as_str()))
+    }
+}
 
-        Doc {
-            key: text(f.key).unwrap_or_default(),
-            url: text(f.url).unwrap_or_default(),
-            sources: all(f.sources),
-            title: text(f.title),
-            body: text(f.body).unwrap_or_default(),
-            links: all(f.links),
-            crawled: date(f.crawled),
-            import_id: number(f.import_id).unwrap_or(0),
+/// A page as the index holds it; `lang` is its language (§7.1).
+fn encode(f: &Fields, doc: &Doc, lang: Option<&str>) -> TantivyDocument {
+    let mut d = TantivyDocument::default();
+    d.add_text(f.key, &doc.key);
+    d.add_text(f.url, &doc.url);
+    d.add_text(f.url_text, &doc.url);
+    if let Some(url) = Url::parse(&doc.url) {
+        for suffix in url.host_suffixes() {
+            d.add_text(f.host_rev, &suffix);
         }
+        if let Some(ext) = url.extension() {
+            d.add_text(f.ext, &ext);
+        }
+    }
+    for source in &doc.sources {
+        d.add_text(f.sources, source);
+    }
+    if let Some(title) = &doc.title {
+        d.add_text(f.title, title);
+    }
+    d.add_text(f.body, &doc.body);
+    let mut hosts = HashSet::new();
+    let mut extensions = HashSet::new();
+    for link in &doc.links {
+        d.add_text(f.links, link);
+        if let Some(url) = Url::parse(link) {
+            hosts.extend(url.host_suffixes());
+            extensions.extend(url.extension());
+        }
+    }
+    for host in hosts {
+        d.add_text(f.link_hosts, &host);
+    }
+    for extension in extensions {
+        d.add_text(f.link_ext, &extension);
+    }
+    if let Some(lang) = lang {
+        d.add_text(f.lang, lang);
+    }
+    if let Some(crawled) = doc.crawled {
+        d.add_date(f.crawled, DateTime::from_timestamp_secs(crawled));
+    }
+    d.add_u64(f.import_id, doc.import_id);
+    d
+}
+
+/// A query whose matches are excluded (`-"exact phrase"`, `-inurl:gemini://`).
+///
+/// Tantivy checks each candidate against an exclusion with `seek_danger`,
+/// which for a phrase asserts the candidate isn't before the phrase's
+/// current match — but a phrase scorer moves to its first match as soon as
+/// it's made, so the assertion fails in debug builds whenever that match
+/// comes after the first candidate (release builds answer correctly). This
+/// wrapper leaves `seek_danger` to `DocSet`'s default, which allows it.
+struct Excluded(Box<dyn Query>);
+
+impl Clone for Excluded {
+    fn clone(&self) -> Self {
+        Excluded(self.0.box_clone())
+    }
+}
+
+impl std::fmt::Debug for Excluded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Excluded").field(&self.0).finish()
+    }
+}
+
+impl Query for Excluded {
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(ExcludedWeight(self.0.weight(enable_scoring)?)))
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.0.query_terms(visitor);
+    }
+}
+
+struct ExcludedWeight(Box<dyn Weight>);
+
+impl Weight for ExcludedWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        Ok(Box::new(ExcludedScorer(self.0.scorer(reader, boost)?)))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        self.0.explain(reader, doc)
+    }
+}
+
+struct ExcludedScorer(Box<dyn Scorer>);
+
+impl DocSet for ExcludedScorer {
+    fn advance(&mut self) -> DocId {
+        self.0.advance()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.0.seek(target)
+    }
+
+    fn doc(&self) -> DocId {
+        self.0.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.0.size_hint()
+    }
+
+    fn cost(&self) -> u64 {
+        self.0.cost()
+    }
+}
+
+impl Scorer for ExcludedScorer {
+    fn score(&mut self) -> Score {
+        self.0.score()
     }
 }
 
@@ -925,6 +1637,14 @@ fn tokenize(analyzer: &mut TextAnalyzer, text: &str) -> Vec<(String, usize, usiz
         out.push((token.text.clone(), token.offset_from, token.offset_to));
     }
     out
+}
+
+/// Index terms of `text`.
+fn tokens_of(analyzer: &mut TextAnalyzer, text: &str) -> Vec<String> {
+    tokenize(analyzer, text)
+        .into_iter()
+        .map(|(term, _, _)| term)
+        .collect()
 }
 
 /// Counts from an indexing run.
@@ -975,6 +1695,7 @@ impl Indexer<'_> {
         engine.reader.reload()?;
         let searcher = engine.reader.searcher();
 
+        let mut docs = Vec::with_capacity(self.batch.len());
         for (key, doc) in self.batch.drain() {
             let doc = match engine.load(&searcher, &key)? {
                 Some(existing) => {
@@ -993,8 +1714,9 @@ impl Indexer<'_> {
             };
             self.writer
                 .delete_term(Term::from_field_text(engine.f.key, &key));
-            self.writer.add_document(engine.encode(&doc))?;
+            docs.push(doc);
         }
+        write_docs(&self.writer, &engine.f, &mut docs)?;
         self.writer.commit()?;
         engine.reader.reload()?;
         Ok(())
@@ -1026,11 +1748,15 @@ mod layout_tests {
         let stamp = std::fs::read_to_string(new.join(STAMP_FILE)).unwrap();
         assert!(stamp.contains(&format!("\"layout\": {INDEX_LAYOUT}")));
 
-        // One from before stamps is layout 1, which is current.
+        // One stamped by an older LOST, of the current layout, gets this
+        // LOST's name. (One from before stamps is layout 1: upgraded, see
+        // `search_tests::upgrading_from_layout_1`.)
         let old = temp("old");
-        std::fs::write(old.join("meta.json"), "{}").unwrap();
+        let stamp = format!("{{\"layout\": {INDEX_LAYOUT}, \"written_by\": \"LOST 0.0.1\"}}");
+        std::fs::write(old.join(STAMP_FILE), stamp).unwrap();
         check_layout(&old).unwrap();
-        assert!(old.join(STAMP_FILE).exists());
+        let stamp = std::fs::read_to_string(old.join(STAMP_FILE)).unwrap();
+        assert!(stamp.contains(env!("CARGO_PKG_VERSION")), "{stamp}");
 
         // One from a newer LOST is left alone.
         let newer = temp("newer");
@@ -1049,5 +1775,252 @@ mod layout_tests {
         for dir in [new, old, newer] {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lost-search-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn doc(url: &str, title: &str, body: &str, links: &[&str]) -> Doc {
+        Doc {
+            key: crate::record::url_key(url).unwrap(),
+            url: url.into(),
+            sources: vec!["test".into()],
+            title: Some(title.into()),
+            body: body.into(),
+            links: links.iter().map(|l| l.to_string()).collect(),
+            crawled: None,
+            import_id: 1,
+        }
+    }
+
+    fn found(engine: &Engine, query: &str) -> Vec<String> {
+        let mut urls: Vec<String> = engine
+            .search(query, Limit::new(0, 100))
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|hit| hit.url)
+            .collect();
+        urls.sort();
+        urls
+    }
+
+    const GERMAN: &str = "Das ist ein ganz normaler deutscher Satz über das Wetter in Berlin, \
+                          und noch einer über die Stadt und ihre vielen schönen Häuser.";
+
+    fn pages() -> Vec<Doc> {
+        vec![
+            doc(
+                "gemini://capsule.example/notes/catfish.gmi",
+                "Fried catfish",
+                "Roll the catfish in cornmeal and fry it.",
+                &["gemini://capsule.example/recipes.pdf"],
+            ),
+            doc(
+                "https://web.example/gemini/protocol",
+                "About the Gemini protocol",
+                "Cornmeal is not mentioned here, but catfish are, far away from that \
+                 other word: one two three four five six seven eight nine ten cornmeal.",
+                &["https://web.example/spec.html"],
+            ),
+            doc(
+                "http://hidden.onion/index.html",
+                "Hidden service",
+                GERMAN,
+                &[],
+            ),
+        ]
+    }
+
+    fn engine_with(name: &str, docs: Vec<Doc>) -> (Engine, std::path::PathBuf) {
+        let dir = temp(name);
+        let engine = Engine::open(&dir).unwrap();
+        let mut indexer = engine.indexer().unwrap();
+        for d in docs {
+            indexer.add(d).unwrap();
+        }
+        indexer.finish().unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn url_words_and_punctuation() {
+        let tokens: Vec<(String, usize)> = url_tokens("Gemini://A.b/c-d?é=1")
+            .into_iter()
+            .map(|t| (t.text, t.position))
+            .collect();
+        let expected: Vec<(String, usize)> = [
+            "gemini", ":", "/", "/", "a", ".", "b", "/", "c", "-", "d", "?", "é", "=", "1",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.to_string(), i))
+        .collect();
+        assert_eq!(tokens, expected);
+        // A long word is left out, but keeps its place.
+        let long = format!("a/{}/b", "x".repeat(MAX_URL_WORD + 1));
+        let tokens: Vec<(String, usize)> = url_tokens(&long)
+            .into_iter()
+            .map(|t| (t.text, t.position))
+            .collect();
+        assert_eq!(
+            tokens,
+            [
+                ("a".into(), 0),
+                ("/".into(), 1),
+                ("/".into(), 3),
+                ("b".into(), 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn operators() {
+        let (engine, dir) = engine_with("operators", pages());
+        let gemini = "gemini://capsule.example/notes/catfish.gmi";
+        let web = "https://web.example/gemini/protocol";
+        let onion = "http://hidden.onion/index.html";
+
+        // inurl: with punctuation.
+        assert_eq!(found(&engine, "inurl:gemini"), [gemini, web]);
+        assert_eq!(found(&engine, "inurl:gemini://"), [gemini]);
+        assert_eq!(found(&engine, "inurl:.onion/"), [onion]);
+        assert_eq!(found(&engine, "allinurl:https:// gemini"), [web]);
+        assert_eq!(found(&engine, "-inurl:gemini:// catfish"), [web]);
+
+        // near:
+        assert_eq!(found(&engine, "catfish near:3 cornmeal"), [gemini]);
+        assert_eq!(found(&engine, "cornmeal near:3 catfish"), [gemini]);
+        assert_eq!(found(&engine, "catfish near:30 cornmeal").len(), 2);
+        assert_eq!(found(&engine, "catfish cornmeal").len(), 2);
+
+        // Prefixes.
+        assert_eq!(found(&engine, "catf*").len(), 2);
+        assert_eq!(found(&engine, "intitle:catf*"), [gemini]);
+        assert_eq!(found(&engine, "\"fried catf*\""), [gemini]);
+        assert_eq!(found(&engine, "catfz*"), Vec::<String>::new());
+        assert_eq!(found(&engine, "inurl:capsu*"), [gemini]);
+        let hits = engine.search("corn*", Limit::new(0, 10)).unwrap();
+        assert!(hits.results.iter().all(|h| !h.snippet_matches.is_empty()));
+
+        // contains:
+        assert_eq!(found(&engine, "contains:pdf"), [gemini]);
+        assert_eq!(found(&engine, "contains:.HTML"), [web]);
+
+        // lang:
+        assert_eq!(found(&engine, "lang:de"), [onion]);
+        assert_eq!(found(&engine, "language:German"), [onion]);
+        assert_eq!(found(&engine, "lang:deutsch Berlin"), [onion]);
+        assert!(found(&engine, "lang:klingon").is_empty());
+        assert!(found(&engine, "lang:de -lang:deu").is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn related_pages() {
+        let words = "catfish cornmeal buttermilk skillet hushpuppies remoulade";
+        let mut docs = vec![
+            doc("https://fish.example/", "Fish fry", words, &[]),
+            doc("https://fish.example/more", "More fish fry", words, &[]),
+            doc("https://other.example/fry", "Southern fry", words, &[]),
+            doc(
+                "https://unrelated.example/",
+                "Gardening",
+                "tomatoes compost trellis mulch seedlings",
+                &[],
+            ),
+        ];
+        // Enough other pages for the words to be rare.
+        for i in 0..20 {
+            docs.push(doc(
+                &format!("https://filler.example/{i}"),
+                "Filler",
+                "nothing to see here at all",
+                &[],
+            ));
+        }
+        let (engine, dir) = engine_with("related", docs);
+        assert_eq!(
+            found(&engine, "related:fish.example"),
+            ["https://other.example/fry"]
+        );
+        assert_eq!(
+            found(&engine, "related:https://other.example/fry"),
+            ["https://fish.example/", "https://fish.example/more"]
+        );
+        assert!(found(&engine, "related:nowhere.example").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upgrading_from_layout_1() {
+        // An index as LOST 0.2 made it: URLs tokenized like text, no link
+        // extensions or languages, no stamp.
+        let data = temp("upgrade");
+        let dir = data.join(INDEX_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut b = Schema::builder();
+            let key = b.add_text_field("key", STRING | STORED);
+            let url = b.add_text_field("url", STORED);
+            let url_text = b.add_text_field("url_text", TEXT);
+            b.add_text_field("host_rev", STRING);
+            b.add_text_field("ext", STRING);
+            let sources = b.add_text_field("sources", STRING | STORED);
+            let title = b.add_text_field("title", TEXT | STORED);
+            let body = b.add_text_field("body", TEXT | STORED);
+            let links = b.add_text_field("links", STRING | STORED);
+            b.add_text_field("link_hosts", STRING);
+            b.add_date_field("crawled", STORED);
+            let import_id = b.add_u64_field("import_id", INDEXED | STORED);
+            let index = Index::create_in_dir(&dir, b.build()).unwrap();
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            for page in pages() {
+                let mut d = TantivyDocument::default();
+                d.add_text(key, &page.key);
+                d.add_text(url, &page.url);
+                d.add_text(url_text, &page.url);
+                d.add_text(sources, "test");
+                d.add_text(title, page.title.as_deref().unwrap());
+                d.add_text(body, &page.body);
+                for link in &page.links {
+                    d.add_text(links, link);
+                }
+                d.add_u64(import_id, 7);
+                writer.add_document(d).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        let engine = Engine::open(&data).unwrap();
+        assert_eq!(engine.num_docs(), 3);
+        assert_eq!(
+            found(&engine, "inurl:gemini://"),
+            ["gemini://capsule.example/notes/catfish.gmi"]
+        );
+        assert_eq!(
+            found(&engine, "lang:de"),
+            ["http://hidden.onion/index.html"]
+        );
+        assert_eq!(engine.count_import(7).unwrap(), 3);
+        let stamp = std::fs::read_to_string(dir.join(STAMP_FILE)).unwrap();
+        assert!(stamp.contains(&format!("\"layout\": {INDEX_LAYOUT}")));
+        assert!(!sibling(&dir, "old").exists());
+        assert!(!sibling(&dir, "upgrading").exists());
+        drop(engine);
+        // Opened again: nothing more to do.
+        let engine = Engine::open(&data).unwrap();
+        assert_eq!(engine.num_docs(), 3);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(data);
     }
 }

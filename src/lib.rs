@@ -18,6 +18,7 @@
 pub mod config;
 pub mod datasources;
 pub mod engine;
+pub mod lang;
 pub mod lostfile;
 pub mod query;
 pub mod record;

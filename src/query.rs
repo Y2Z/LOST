@@ -3,19 +3,27 @@
 //! Turns what was typed into the search box into an engine-agnostic syntax
 //! tree. No Tantivy types here; `engine.rs` translates the tree.
 //!
-//! Words, `"phrases"` (with `*` for missing words), `-exclusions`, `OR` / `|`,
-//! `AND`, `( )`, and the operators `site:`, `intitle:`, `allintitle:`,
-//! `inurl:`, `allinurl:`, `intext:`, `allintext:`, `filetype:` / `ext:` and
-//! `link:`. Implicit AND binds loosest, as on Google:
-//! `catfish OR tilapia recipe` means `(catfish OR tilapia) AND recipe`.
+//! Words (`catf*` for any word starting with `catf`), `"phrases"` (with `*`
+//! for missing words), `-exclusions`, `OR` / `|`, `AND`, `( )`, `near:N`,
+//! and the operators `site:`, `intitle:`, `allintitle:`, `inurl:`,
+//! `allinurl:`, `intext:`, `allintext:`, `filetype:` / `ext:`, `link:`,
+//! `contains:`, `related:` and `lang:` / `language:`. Implicit AND binds
+//! loosest, as on Google: `catfish OR tilapia recipe` means
+//! `(catfish OR tilapia) AND recipe`; `near:` binds tightest.
 
 use std::fmt;
 use std::str::FromStr;
 
+/// `near:` without a number: at most this many words apart.
+pub const DEFAULT_NEAR: u32 = 5;
+/// The most `near:` takes.
+pub const MAX_NEAR: u32 = 100;
+
 /// A parsed query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
-    /// A single word as typed (the engine tokenizes it).
+    /// A single word as typed (the engine tokenizes it). One ending in `*`
+    /// (`catf*`) stands for every word starting with what's before it.
     Word(String),
     /// An exact phrase.
     Phrase(String),
@@ -28,6 +36,22 @@ pub enum Node {
     Ext(String),
     /// `link:` — pages linking to this URL, or to anywhere on this site.
     Link(String),
+    /// `catfish near:3 cornmeal` — words or phrases at most `distance` words
+    /// apart, in either order; in one part of the page if `scope` says so
+    /// (`allintitle:`, or `intitle:` on each of them).
+    Near {
+        parts: Vec<String>,
+        distance: u32,
+        scope: Option<Scope>,
+    },
+    /// `contains:` — pages linking to files with this extension (lowercase,
+    /// without the dot).
+    Contains(String),
+    /// `related:` — pages like the ones on this site, or like this one page.
+    Related(String),
+    /// `lang:` / `language:` — pages in this language, as typed (a code or
+    /// a name; the engine works out which language it is).
+    Lang(String),
     /// Results must not match this.
     Not(Box<Node>),
     /// All of these must match.
@@ -78,6 +102,10 @@ enum Op {
     AllIn(Scope),
     Ext,
     Link,
+    Near,
+    Contains,
+    Related,
+    Lang,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +201,10 @@ fn classify(word: &str) -> Token {
             "allintext" => Some(Op::AllIn(Scope::Text)),
             "filetype" | "ext" => Some(Op::Ext),
             "link" => Some(Op::Link),
+            "near" => Some(Op::Near),
+            "contains" => Some(Op::Contains),
+            "related" => Some(Op::Related),
+            "lang" | "language" => Some(Op::Lang),
             _ => None,
         };
         if let Some(op) = op {
@@ -229,11 +261,11 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Option<Node> {
-        let first = self.parse_unary();
+        let first = self.parse_near();
         let mut alternatives: Vec<Node> = first.into_iter().collect();
         while self.peek() == Some(&Token::Or) {
             self.pos += 1;
-            if let Some(node) = self.parse_unary() {
+            if let Some(node) = self.parse_near() {
                 alternatives.push(node);
             }
         }
@@ -242,6 +274,24 @@ impl Parser {
             1 => alternatives.pop(),
             _ => Some(Node::Or(alternatives)),
         }
+    }
+
+    /// `a near:3 b near:2 c`: what's on either side of each `near:`.
+    fn parse_near(&mut self) -> Option<Node> {
+        let mut left = self.parse_unary();
+        while let Some(Token::Op(Op::Near, value)) = self.peek().cloned() {
+            self.pos += 1;
+            let distance = value
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_NEAR)
+                .min(MAX_NEAR);
+            let right = self.parse_unary();
+            left = match (left, right) {
+                (Some(l), Some(r)) => Some(near(l, r, distance)),
+                (l, r) => l.or(r),
+            };
+        }
+        left
     }
 
     fn parse_unary(&mut self) -> Option<Node> {
@@ -310,8 +360,61 @@ impl Parser {
                 .operand(value)
                 .map(|n| Node::Ext(text(n).trim_start_matches('.').to_ascii_lowercase())),
             Op::Link => self.operand(value).map(|n| Node::Link(text(n))),
+            Op::Contains => self
+                .operand(value)
+                .map(|n| Node::Contains(text(n).trim_start_matches('.').to_ascii_lowercase())),
+            Op::Related => self.operand(value).map(|n| Node::Related(text(n))),
+            Op::Lang => self.operand(value).map(|n| Node::Lang(text(n))),
+            // Only between two words or phrases (`parse_near`).
+            Op::Near => None,
         }
     }
+}
+
+/// `left near:distance right`. Only words and phrases can be near each other
+/// (both in the same part of the page, if one is named); anything else is
+/// simply required as well, as if `near:` weren't there.
+fn near(left: Node, right: Node, distance: u32) -> Node {
+    fn part(node: &Node) -> Option<(String, Option<Scope>)> {
+        match node {
+            Node::Word(w) | Node::Phrase(w) => Some((w.clone(), None)),
+            Node::In(scope, inner) => match inner.as_ref() {
+                Node::Word(w) | Node::Phrase(w) => Some((w.clone(), Some(*scope))),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let joined = match (&left, part(&right)) {
+        (
+            Node::Near {
+                parts,
+                distance: d,
+                scope,
+            },
+            Some((text, s)),
+        ) if *scope == s => Some(Node::Near {
+            parts: parts.iter().cloned().chain([text]).collect(),
+            distance: distance.max(*d),
+            scope: s,
+        }),
+        (_, Some((r, rs))) => match part(&left) {
+            Some((l, ls)) if ls == rs => Some(Node::Near {
+                parts: vec![l, r],
+                distance,
+                scope: ls,
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+    joined.unwrap_or_else(|| match left {
+        Node::And(mut children) => {
+            children.push(right);
+            Node::And(children)
+        }
+        left => Node::And(vec![left, right]),
+    })
 }
 
 /// The words a result is expected to contain: every word and phrase that
@@ -320,11 +423,18 @@ pub fn positive_terms(node: &Node) -> Vec<String> {
     fn walk(node: &Node, out: &mut Vec<String>) {
         match node {
             Node::Word(w) | Node::Phrase(w) => out.push(w.clone()),
+            Node::Near { parts, .. } => out.extend(parts.iter().cloned()),
             Node::And(children) | Node::Or(children) => {
                 children.iter().for_each(|c| walk(c, out));
             }
             Node::In(_, inner) => walk(inner, out),
-            Node::Not(_) | Node::Site(_) | Node::Ext(_) | Node::Link(_) => {}
+            Node::Not(_)
+            | Node::Site(_)
+            | Node::Ext(_)
+            | Node::Link(_)
+            | Node::Contains(_)
+            | Node::Related(_)
+            | Node::Lang(_) => {}
         }
     }
     let mut out = Vec::new();
@@ -342,6 +452,18 @@ pub fn has_positive(node: &Node) -> bool {
         _ => true,
     }
 }
+
+/// `catf*`: the word before the `*`, if `word` is a prefix to look up. A
+/// lone `*` isn't one (in a phrase it stands for missing words), nor is one
+/// with fewer than [`MIN_PREFIX`] characters, which would stand for too many
+/// words to be of use.
+pub fn prefix(word: &str) -> Option<&str> {
+    let stem = word.strip_suffix('*')?.trim_end_matches('*');
+    (stem.chars().filter(|c| c.is_alphanumeric()).count() >= MIN_PREFIX).then_some(stem)
+}
+
+/// The fewest letters or digits a `*` prefix can have.
+pub const MIN_PREFIX: usize = 3;
 
 /// Splits a phrase at standalone `*` words: the text chunks in order, each
 /// with the number of `*` right before it. Leading and trailing `*` say
@@ -603,6 +725,110 @@ mod tests {
         );
         assert_eq!(parse("https://example.com"), Some(w("https://example.com")));
         assert_eq!(parse("foo:bar"), Some(w("foo:bar")));
+    }
+
+    fn near_of(parts: &[&str], distance: u32, scope: Option<Scope>) -> Node {
+        Node::Near {
+            parts: parts.iter().map(|p| p.to_string()).collect(),
+            distance,
+            scope,
+        }
+    }
+
+    #[test]
+    fn near() {
+        assert_eq!(
+            parse("catfish near:3 cornmeal"),
+            Some(near_of(&["catfish", "cornmeal"], 3, None))
+        );
+        assert_eq!(
+            parse("\"fried catfish\" NEAR:2 cornmeal recipe"),
+            Some(Node::And(vec![
+                near_of(&["fried catfish", "cornmeal"], 2, None),
+                w("recipe")
+            ]))
+        );
+        // No number, or one that isn't: the default. Too big: the most.
+        assert_eq!(
+            parse("a near: b"),
+            Some(near_of(&["a", "b"], DEFAULT_NEAR, None))
+        );
+        assert_eq!(
+            parse("a near:x b"),
+            Some(near_of(&["a", "b"], DEFAULT_NEAR, None))
+        );
+        assert_eq!(
+            parse("a near:5000 b"),
+            Some(near_of(&["a", "b"], MAX_NEAR, None))
+        );
+        // Chained: all of them, as far apart as the widest says.
+        assert_eq!(
+            parse("a near:2 b near:4 c"),
+            Some(near_of(&["a", "b", "c"], 4, None))
+        );
+        // Binds tighter than OR.
+        assert_eq!(
+            parse("a near:2 b OR c"),
+            Some(Node::Or(vec![near_of(&["a", "b"], 2, None), w("c")]))
+        );
+        // In one part of the page.
+        assert_eq!(
+            parse("allintitle: fried near:1 catfish"),
+            Some(near_of(&["fried", "catfish"], 1, Some(Scope::Title)))
+        );
+        assert_eq!(
+            parse("intitle:fried near:1 intitle:catfish"),
+            Some(near_of(&["fried", "catfish"], 1, Some(Scope::Title)))
+        );
+        // What can't be near something is just required.
+        assert_eq!(
+            parse("site:x.com near:3 b"),
+            Some(Node::And(vec![Node::Site("x.com".into()), w("b")]))
+        );
+        assert_eq!(
+            parse("intitle:a near:3 b"),
+            Some(Node::And(vec![within(Scope::Title, w("a")), w("b")]))
+        );
+        assert_eq!(parse("near:3 b"), Some(w("b")));
+        assert_eq!(parse("a near:3"), Some(w("a")));
+        assert_eq!(
+            positive_terms(&parse("a near:3 \"b c\"").unwrap()),
+            vec!["a", "b c"]
+        );
+    }
+
+    #[test]
+    fn prefixes() {
+        assert_eq!(parse("catf*"), Some(w("catf*")));
+        assert_eq!(prefix("catf*"), Some("catf"));
+        assert_eq!(prefix("catf**"), Some("catf"));
+        assert_eq!(prefix("ca*"), None);
+        assert_eq!(prefix("*"), None);
+        assert_eq!(prefix("catfish"), None);
+        assert_eq!(prefix("e-ma*"), Some("e-ma"));
+    }
+
+    #[test]
+    fn links_languages_and_relatives() {
+        assert_eq!(parse("contains:.PDF"), Some(Node::Contains("pdf".into())));
+        assert_eq!(
+            parse("related:example.com"),
+            Some(Node::Related("example.com".into()))
+        );
+        assert_eq!(parse("lang:de"), Some(Node::Lang("de".into())));
+        assert_eq!(
+            parse("Language: German catfish"),
+            Some(Node::And(vec![Node::Lang("German".into()), w("catfish")]))
+        );
+        assert_eq!(
+            parse("catfish -lang:en"),
+            Some(Node::And(vec![
+                w("catfish"),
+                Node::Not(Box::new(Node::Lang("en".into())))
+            ]))
+        );
+        assert!(has_positive(&parse("lang:de").unwrap()));
+        assert!(positive_terms(&parse("lang:de related:x.org contains:pdf a").unwrap()) == ["a"]);
     }
 
     #[test]
