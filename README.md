@@ -115,7 +115,7 @@ lost-spider gemini --proxy socks5://127.0.0.1:9050 # Gemini through Tor
 lost -d my.lost                                    # import what it found
 ```
 
-It obeys robots.txt, asks each server for one thing a second (`--delay`), and saves everything into one `.lost` file signed with your ID.  The file is complete even if you stop it with Ctrl-C.  See `lost-spider --help` for search boxes, blacklists, proxies and limits.
+It obeys robots.txt, asks each server for one thing a second (`--delay`), and saves everything into one `.lost` file, unsigned unless you ask for `--sign`.  The file is complete even if you stop it with Ctrl-C.  See `lost-spider --help` for search boxes, blacklists, proxies and limits.
 
 `onion` needs [Tor](https://www.torproject.org/) running, and `i2p` an I2P router ([i2pd](https://i2pd.website/) or [Java I2P](https://geti2p.net/)).  I2P is slow: reaching a site for the first time can take a minute or more, so its timeout is 120 seconds by default (`-t` changes it, for any network), and on a router (or Tor) that has just started, `lost-spider` waits a few minutes until it can reach sites.  Images and other files are never downloaded, only their links.  Before crawling `.onion` sites, `lost-spider` gets [Ahmia](https://ahmia.fi/)'s list of onion sites banned for child abuse material and skips them; it won't start without that list.  Darknets host all sorts of things, so it's worth keeping a `--blacklist` with `title:/…/` and `body:/…/` rules for what you don't want in your dataset.
 

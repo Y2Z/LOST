@@ -831,7 +831,7 @@ lost.remove_import(import_id)?;
 
 ## 15. lost-spider
 
-A crawler for the networks LOST can't get dumps of. It saves what it finds as a signed `.lost` file, which LOST imports like any other. LOST never goes online (§1); the spider is the one part that does, so it's kept apart:
+A crawler for the networks LOST can't get dumps of. It saves what it finds as a `.lost` file, unsigned unless `--sign` is given, which LOST imports like any other. LOST never goes online (§1); the spider is the one part that does, so it's kept apart:
 
 - **Built only on request:** the `spider` feature isn't in the default set (`cargo build --release --no-default-features --features spider --bin lost-spider`, `cargo install lost --features spider`, or `make spider`). The packages don't include it, so installing LOST never means something crawls in the background.
 - **Its own code:** `src/spider/` holds the binary's own modules (`main.rs`, `crawl.rs` for what every network shares, one file per network). It uses the library — `lostfile` for writing and signing, `urls`, `Identity` — and nothing in the library or the `lost` binary knows it exists. Its dependencies are optional and only it uses them.
@@ -850,7 +850,8 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | Option | What it does |
 |---|---|
 | `-o`, `--output PATH` | A `.lost` file, or a folder to put one in. Default name: `lost-crawl-data-NETWORK-YYYYMMDD-HHMMSS.lost` (UTC), in the current folder. An existing file isn't touched: ` (1)`, ` (2)`… goes before `.lost` |
-| `-c`, `--continue` | Carry on with exactly the `-o` file (§9.4, §15.3), whoever signed it; started under that name if it doesn't exist |
+| `-c`, `--continue` | Carry on with exactly the `-o` file (§9.4, §15.3), whoever signed it (its signature is removed, or replaced by yours with `--sign`); started under that name if it doesn't exist |
+| `--sign` | Sign the file with your ID (§9.2), made if there's none yet; with `-c`, your signature replaces the file's, whoever's it was. Without it the file is unsigned (no ID is read or made), and with `-c` a signature it had is removed: the header loses its `signer`, the signed flag is cleared and no signature follows the footer (§9.4). Unsigned is the default because a signature says who made the file, and anonymity is one of LOST's points |
 | `--link URL`, `--links FILE` | Crawled first, even if nothing links to them (`example.org` means `gemini://example.org/`, or `gopher://…` for Gopher). A file has one a line; blank lines and `#` comments are skipped |
 | `--dont-crawl` | Fetch only the `--link` URLs (following their redirects) and none of the links on them: an easy way to add certain pages to a file, and nothing else. No seeds, and with `-c` nothing from the file's pages; a search box among them gets the `--search` phrases, and the results pages are saved. Needs `--link` or `--links` |
 | `--search PHRASE`, `--searches FILE` | Typed into the search boxes found (§15.2) |
@@ -861,9 +862,9 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
-- Signed with your ID (§9.2), made if there's none yet ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."); unsigned only if LOST's folder can't be found.
+- Unsigned ("Saving to NAME, unsigned."), or with `--sign` signed with your ID ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."). If `--sign` is given and the ID can't be read or made, the spider stops before crawling rather than leave the file unsigned.
 - Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Crawling Geminispace for 2 hours, 5 minutes, 9 seconds… 1,234 pages saved · 56 capsules · 7,890 links waiting` (the time is this run's) — `Scraping Geminispace…` with `--dont-crawl`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise.
-- Ctrl-C (or SIGTERM, SIGHUP) stops: requests under way are abandoned, pages already received are written, and the file is finished and signed. A second Ctrl-C quits at once, leaving the file as of its last checkpoint. The last lines say how to continue and how to import.
+- Ctrl-C (or SIGTERM, SIGHUP) stops: requests under way are abandoned, pages already received are written, and the file is finished (and signed, with `--sign`). A second Ctrl-C quits at once, leaving the file as of its last checkpoint. The last lines say how to continue and how to import.
 
 ### 15.2 Crawling (`crawl.rs`)
 
