@@ -6,6 +6,7 @@
 #   make tarball               lost-VERSION-ARCH-linux.tar.gz in target/
 #   make deb                   a .deb, with cargo-deb (cargo install cargo-deb)
 #   make appimage              an AppImage, with appimagetool (dist/appimage.sh)
+#   make spider                lost-spider, the crawler (not built by default)
 
 PREFIX ?= /usr/local
 DESTDIR ?=
@@ -13,7 +14,7 @@ VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 ARCH := $(shell uname -m)
 NAME := lost-$(VERSION)-$(ARCH)-linux
 
-.PHONY: all build install uninstall tarball deb appimage clean
+.PHONY: all build install uninstall tarball deb appimage spider clean
 
 all: build
 
@@ -40,6 +41,10 @@ deb:
 
 appimage: build
 	sh dist/appimage.sh
+
+spider:
+	cargo build --release --no-default-features --features spider --bin lost-spider
+	@echo "target/release/lost-spider"
 
 clean:
 	cargo clean

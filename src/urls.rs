@@ -174,13 +174,28 @@ impl std::fmt::Display for Url {
 /// URL, without its `#fragment`. Returns `None` for links that don't lead to
 /// another page (`javascript:`, `mailto:`, `#anchor`, `data:`, …).
 pub fn resolve(base: &Url, href: &str) -> Option<String> {
+    let url = resolve_any(base, href)?;
+    (url.scheme == "http" || url.scheme == "https").then(|| url.to_string())
+}
+
+/// Like [`resolve`], for any scheme with an authority (`gemini://`,
+/// `gopher://`, …): the absolute URL, without its `#fragment`. Relative
+/// links take `base`'s scheme. `None` for links that don't lead to another
+/// page (`mailto:`, `#anchor`, …).
+pub fn resolve_any(base: &Url, href: &str) -> Option<Url> {
     let href = href.trim();
     let href = href.split('#').next().unwrap_or("");
     if href.is_empty() {
         return None;
     }
     let lower = href.to_ascii_lowercase();
-    let absolute = if lower.starts_with("http://") || lower.starts_with("https://") {
+    let has_scheme = lower.split_once("://").is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+    });
+    let absolute = if has_scheme {
         Url::parse(href)?
     } else if lower.contains(':') && !lower.starts_with('/') && !lower.starts_with('?') {
         // Some other scheme (javascript:, mailto:, tel:, data:, …) — or a
@@ -196,12 +211,9 @@ pub fn resolve(base: &Url, href: &str) -> Option<String> {
     } else {
         Url::parse(&join(base, href))?
     };
-    if absolute.scheme != "http" && absolute.scheme != "https" {
-        return None;
-    }
     let mut url = absolute;
     url.fragment = None;
-    Some(url.to_string())
+    Some(url)
 }
 
 /// Joins a path-relative, root-relative or query-only link onto `base`.
@@ -282,6 +294,112 @@ fn uppercase_escapes(s: &str) -> String {
         }
     }
     out
+}
+
+/// A host name as it's looked up and sent: internationalized labels in
+/// punycode (`café.example` → `xn--caf-dma.example`), lowercase. ASCII
+/// names (and `[IPv6]` literals) come back lowercased. `None` for a name
+/// that can't be one (an empty label, or one too long).
+///
+/// This is IDNA without its Unicode mapping tables: labels are lowercased and
+/// encoded (RFC 3492), not normalized first, which is all links in practice
+/// need.
+pub fn ascii_host(host: &str) -> Option<String> {
+    let host = host.trim_end_matches('.');
+    if host.is_ascii() {
+        return Some(host.to_ascii_lowercase());
+    }
+    let host = host
+        .to_lowercase()
+        .replace(['\u{3002}', '\u{ff0e}', '\u{ff61}'], ".");
+    let mut labels = Vec::new();
+    for label in host.split('.') {
+        if label.is_empty() {
+            return None;
+        }
+        let ascii = if label.is_ascii() {
+            label.to_string()
+        } else {
+            format!("xn--{}", punycode(label)?)
+        };
+        if ascii.len() > 63 {
+            return None;
+        }
+        labels.push(ascii);
+    }
+    let ascii = labels.join(".");
+    (ascii.len() <= 253).then_some(ascii)
+}
+
+/// RFC 3492's Bootstring with punycode's parameters.
+fn punycode(input: &str) -> Option<String> {
+    const BASE: u32 = 36;
+    const T_MIN: u32 = 1;
+    const T_MAX: u32 = 26;
+    const SKEW: u32 = 38;
+    const DAMP: u32 = 700;
+
+    fn adapt(mut delta: u32, points: u32, first: bool) -> u32 {
+        delta /= if first { DAMP } else { 2 };
+        delta += delta / points;
+        let mut k = 0;
+        while delta > (BASE - T_MIN) * T_MAX / 2 {
+            delta /= BASE - T_MIN;
+            k += BASE;
+        }
+        k + (BASE - T_MIN + 1) * delta / (delta + SKEW)
+    }
+    fn digit(d: u32) -> char {
+        (if d < 26 {
+            b'a' + d as u8
+        } else {
+            b'0' + (d - 26) as u8
+        }) as char
+    }
+
+    let code_points: Vec<u32> = input.chars().map(|c| c as u32).collect();
+    let mut out: String = input.chars().filter(char::is_ascii).collect();
+    let basic = out.len() as u32;
+    if basic > 0 {
+        out.push('-');
+    }
+    let (mut n, mut delta, mut bias, mut handled) = (128u32, 0u32, 72u32, basic);
+    while (handled as usize) < code_points.len() {
+        let m = code_points.iter().copied().filter(|&c| c >= n).min()?;
+        delta = delta.checked_add((m - n).checked_mul(handled + 1)?)?;
+        n = m;
+        for &c in &code_points {
+            if c < n {
+                delta = delta.checked_add(1)?;
+            }
+            if c == n {
+                let mut q = delta;
+                let mut k = BASE;
+                loop {
+                    let t = if k <= bias {
+                        T_MIN
+                    } else if k >= bias + T_MAX {
+                        T_MAX
+                    } else {
+                        k - bias
+                    };
+                    if q < t {
+                        break;
+                    }
+                    out.push(digit(t + (q - t) % (BASE - t)));
+                    q = (q - t) / (BASE - t);
+                    k += BASE;
+                }
+                out.push(digit(q));
+                bias = adapt(delta, handled + 1, handled == basic);
+                delta = 0;
+                handled += 1;
+            }
+        }
+        delta = delta.checked_add(1)?;
+        n += 1;
+    }
+    Some(out)
 }
 
 /// See [`Url::host_suffixes`].
@@ -437,6 +555,61 @@ mod tests {
         assert_eq!(r("#top"), None);
         assert_eq!(r("ftp://x.com/f"), None);
         assert_eq!(r(""), None);
+    }
+
+    #[test]
+    fn punycode_hosts() {
+        assert_eq!(
+            ascii_host("café.example").as_deref(),
+            Some("xn--caf-dma.example")
+        );
+        assert_eq!(
+            ascii_host("München.DE").as_deref(),
+            Some("xn--mnchen-3ya.de")
+        );
+        assert_eq!(
+            ascii_host("bücher.example.").as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+        assert_eq!(
+            ascii_host("日本語。jp").as_deref(),
+            Some("xn--wgv71a119e.jp")
+        );
+        assert_eq!(
+            ascii_host("ドメイン名例.jp").as_deref(),
+            Some("xn--eckwd4c7cu47r2wf.jp")
+        );
+        assert_eq!(ascii_host("Example.ORG").as_deref(), Some("example.org"));
+        assert_eq!(
+            ascii_host("xn--caf-dma.example").as_deref(),
+            Some("xn--caf-dma.example")
+        );
+        assert_eq!(ascii_host("[::1]").as_deref(), Some("[::1]"));
+        assert_eq!(ascii_host("é..example"), None);
+    }
+
+    #[test]
+    fn resolving_links_of_any_scheme() {
+        let base = Url::parse("gemini://example.org:1965/gemlog/post.gmi").unwrap();
+        let r = |h: &str| resolve_any(&base, h).map(|u| u.to_string());
+        assert_eq!(
+            r("next.gmi"),
+            Some("gemini://example.org/gemlog/next.gmi".into())
+        );
+        assert_eq!(r("/"), Some("gemini://example.org/".into()));
+        assert_eq!(r("//other.net/x"), Some("gemini://other.net/x".into()));
+        assert_eq!(
+            r("gemini://Other.net:1966/a"),
+            Some("gemini://other.net:1966/a".into())
+        );
+        assert_eq!(
+            r("https://example.com/"),
+            Some("https://example.com/".into())
+        );
+        assert_eq!(r("mailto:a@b.c"), None);
+        assert_eq!(r("#top"), None);
+        // `resolve` itself still only gives the web.
+        assert_eq!(resolve(&base, "next.gmi"), None);
     }
 
     #[test]

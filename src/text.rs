@@ -1,11 +1,14 @@
 //! Small text helpers shared by data sources: HTML to plain text, truncation,
 //! and date formatting. Dependency-free and tested.
 
-/// Converts the simple HTML found in sources like Hacker News into plain text.
+/// Converts HTML into plain text: the simple HTML of sources like Hacker
+/// News, and whole web pages.
 ///
-/// Paragraphs and line breaks become newlines, every other tag is dropped
-/// (keeping its text), and character references (`&amp;`, `&#x27;`, `&#62;`, …)
-/// are decoded. Not a general HTML parser: scripts and styles aren't expected.
+/// Paragraphs, headings and other blocks become blank lines, line breaks
+/// newlines, table cells spaces; every other tag is dropped (keeping its
+/// text), and character references (`&amp;`, `&#x27;`, `&#62;`, …) are
+/// decoded. What isn't text — scripts, styles, comments, SVG, templates —
+/// is left out. Not a full HTML parser.
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
@@ -14,18 +17,46 @@ pub fn html_to_text(html: &str) -> String {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
 
+        if rest.starts_with("<!--") {
+            rest = rest[4..].find("-->").map_or("", |end| &rest[4 + end + 3..]);
+            continue;
+        }
         if rest.starts_with('<') {
             match rest.find('>') {
                 Some(end) => {
-                    let tag = tag_name(&rest[1..end]);
+                    let inside = &rest[1..end];
+                    let tag = tag_name(inside);
+                    // `<svg/>` closes itself (SVG is foreign content, where
+                    // that works); in HTML a `/` on `<script/>` and the
+                    // rest means nothing, so they still run to their end.
+                    let closed = tag == "svg" && inside.trim_end().ends_with('/');
+                    rest = &rest[end + 1..];
                     match tag.as_str() {
-                        "p" | "/p" | "div" | "/div" | "pre" | "/pre" | "li" => {
-                            push_break(&mut out, 2)
+                        "script" | "style" | "svg" | "template" | "noembed" if !closed => {
+                            // Up to the closing tag, which is all that ends them.
+                            let close = format!("</{tag}");
+                            rest = match find_ignoring_case(rest, &close) {
+                                Some(at) => match rest[at..].find('>') {
+                                    Some(gt) => &rest[at + gt + 1..],
+                                    None => "",
+                                },
+                                None => "",
+                            };
                         }
-                        "br" | "br/" => push_break(&mut out, 1),
+                        "p" | "/p" | "div" | "/div" | "pre" | "/pre" | "li" | "h1" | "/h1"
+                        | "h2" | "/h2" | "h3" | "/h3" | "h4" | "/h4" | "h5" | "/h5" | "h6"
+                        | "/h6" | "ul" | "/ul" | "ol" | "/ol" | "table" | "/table" | "tr"
+                        | "blockquote" | "/blockquote" | "section" | "/section" | "article"
+                        | "/article" | "header" | "/header" | "footer" | "/footer" | "nav"
+                        | "/nav" | "main" | "/main" | "aside" | "/aside" | "form" | "/form"
+                        | "dl" | "/dl" | "dt" | "dd" | "hr" | "figure" | "/figure" | "title"
+                        | "/title" => push_break(&mut out, 2),
+                        "br" => push_break(&mut out, 1),
+                        "td" | "th" if !out.is_empty() && !out.ends_with(char::is_whitespace) => {
+                            out.push(' ')
+                        }
                         _ => {}
                     }
-                    rest = &rest[end + 1..];
                 }
                 None => {
                     // A lone '<' is text.
@@ -56,7 +87,16 @@ fn tag_name(inside: &str) -> String {
     let end = inside
         .find(|c: char| c.is_whitespace())
         .unwrap_or(inside.len());
-    inside[..end].to_ascii_lowercase()
+    inside[..end].trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Where an ASCII `needle` first appears in `haystack`, in any case,
+/// without copying the haystack.
+fn find_ignoring_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn push_break(out: &mut String, newlines: usize) {
@@ -367,6 +407,23 @@ mod tests {
             html_to_text(html),
             "That's it: https://x.com/a\n\nSecond \"para\" > 1 > 0 & more.\n\n  let x = 1;"
         );
+    }
+
+    #[test]
+    fn web_pages() {
+        let html = "<html><head><title>T</title><style>p { color: red }</style>\
+            <script>var a = '<p>no</p>';</script></head><body><!-- hidden <p>no</p> -->\
+            <h1>Heading</h1>Text<table><tr><td>a</td><td>b</td></tr></table>\
+            <SCRIPT type=x>alert(1)</SCRIPT>end</body></html>";
+        assert_eq!(html_to_text(html), "T\n\nHeading\n\nText\n\na b\n\nend");
+        assert_eq!(html_to_text("a<!-- never closed"), "a");
+        assert_eq!(html_to_text("a<script>never closed"), "a");
+        // A self-closing SVG hides nothing after it; an SVG with content
+        // hides its content.
+        assert_eq!(html_to_text("a<svg/>b<p>c"), "ab\n\nc");
+        assert_eq!(html_to_text("a<svg viewBox=\"0 0 1 1\" />b"), "ab");
+        assert_eq!(html_to_text("a<SVG><text>x</text></Svg>b"), "ab");
+        assert_eq!(html_to_text("a<br/>b<hr/>c"), "a\nb\n\nc");
     }
 
     #[test]
