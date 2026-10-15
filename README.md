@@ -42,6 +42,7 @@ lost -d CC-MAIN-…-00000.warc.wet.gz CC-MAIN-…-00000.warc.wat.gz   # import C
 lost --imports                    # list past imports to see what's in the database
 lost --remove-import 3            # remove import along with all pages that came from it
 lost -e rust.lost rust compiler   # export what a search finds (or everything: lost -e all.lost)
+lost -e rust.lost --sign rust     # the same, signed with your ID (exports are unsigned by default)
 ```
 
 #### Supported search operators:
@@ -96,7 +97,7 @@ SELECT * FROM `bigquery-public-data.hacker_news.full` WHERE timestamp >= '2026-0
 
 #### LOST files
 
-LOST is capable of importing and exporting `.lost` dataset files, which makes it possible to freely and safely exchange crawl data with other LOST users.  They can be optionally signed, to ensure that your database doesn't get corrupted or spammed.  Both exports and imports can be made either via CLI (see [Usage](#working-with-datasets)) or GUI (Settings → Data).
+LOST is capable of importing and exporting `.lost` dataset files, which makes it possible to freely and safely exchange crawl data with other LOST users.  They aren't signed unless you ask (`lost -e FILE --sign`, or the "Sign it" checkbox): a signature lets others tell which files are yours and keeps your database from getting corrupted or spammed, but it also says who made the file.  Both exports and imports can be made either via CLI (see [Usage](#working-with-datasets)) or GUI (Settings → Data).
 
 #### Crawling: Gemini, Gopher, .onion and I2P
 

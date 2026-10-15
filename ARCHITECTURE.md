@@ -69,7 +69,7 @@ Status: **pre-alpha, design stage.**
 | `-w` | `--with-server` | — | — | GUI plus web server in one process |
 | `-V` | `--version` | — | — | Print version |
 | | `--suggest` | `TEXT` | — | Print autocomplete suggestions (§7.4), one per line |
-| | `--unsigned` | — | `-e` | Don't sign the export (it's signed by default, §9.2) |
+| | `--sign` | — | `-e` | Sign the export with your ID (it's unsigned by default, §9.2) |
 | | `--imports` | — | — | List past imports, oldest first: number, local date, source, pages, new, updated, status, files (cut to the terminal's width). `-f json` gives the `imports` rows |
 | | `--remove-import` | `ID` | — | Remove import `ID` and the pages whose current version came from it (§6.2), after asking on the terminal; `--yes` skips the question (needed without a terminal). Exit 1 if the answer is no |
 | | `--trusted` | — | — | List trusted people: ID, since when, full key. `-f json` gives the `trust` rows |
@@ -90,7 +90,7 @@ Same as SQL's `LIMIT` (MySQL/SQLite form), in both the CLI and the Web API:
 - A query (positional words or `-i`) cannot be combined with `-s`, `-b`, `-w` or `-d`. With `-e` it says what to export.
 - `-d` and `-e` cannot be combined with each other or with `-s`, `-b`, `-w`.
 - `-b` implies `-s`. `-w` implies the GUI.
-- `-f` also applies to `--imports` and `--trusted`. `-f`, `-l`, `-o` otherwise only make sense with a search, `--unsigned` only with `-e`; they are an error otherwise.
+- `-f` also applies to `--imports` and `--trusted`. `-f`, `-l`, `-o` otherwise only make sense with a search, `--sign` only with `-e`; they are an error otherwise.
 - `lost` with no arguments, in an environment with no display (no `DISPLAY` / `WAYLAND_DISPLAY` on Linux/BSD, or GUI not compiled in): print an error explaining why, followed by usage. Exit code 2.
 - There's no terminal UI, by design: on a machine without a display, `lost -s` and a text-mode browser (lynx, w3m) give the same thing, through the web UI's script-free pages (§10.3).
 
@@ -553,7 +553,7 @@ A portable file for sharing crawl data between LOST users — over BitTorrent, S
 ### 9.2 Signing, trust and anonymity
 
 - **Your ID** is an ed25519 key pair made on the first signed export (`signing.key` in the per-user folder, §6.1, mode 0600). The public key is the identity — a pseudonym, never a name — shown as its first 16 hex digits: `3f9a 1c2e 77b0 1d4e`. Settings → Configuration shows it under *Require signature*, with *New ID…*; `lost --new-id` does the same. A new ID replaces the key for good (written next to it, then moved over it). The old ID is added to the trusted people ("your earlier ID"), so files signed with it still import without a question; files already shared keep showing the old ID, and people who trust it are asked about files with the new one.
-- **Exports are signed by default.** The GUI has a "Sign it" checkbox, ticked every time (the choice isn't remembered); the CLI has `--unsigned`.
+- **Exports are unsigned by default**, as `lost-spider`'s files are (§15.1): a signature says who made a file, and anonymity is one of LOST's points. The GUI has a "Sign it" checkbox, unticked every time (the choice isn't remembered, so a file is signed only when you mean it); the CLI has `--sign`. No key is read or made for an unsigned export.
 - The signature covers a fixed context string, the BLAKE3 hash of the header, and every chunk's offset, size, page count and hash. So a changed byte is caught wherever it is: in the header or footer when the file is opened ("changed after it was signed … not imported"), in a chunk when that chunk's hash doesn't match.
 - **Importing:** files signed by you, or by someone in the `trust` table, are imported without a question. For the others, `import.trust` decides:
 

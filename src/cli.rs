@@ -617,11 +617,12 @@ fn export(args: &Args) -> Result<i32> {
     let query = (!query.is_empty()).then_some(query);
 
     let (_, lost) = open()?;
-    let identity = if args.unsigned {
+    // Unsigned unless asked: no key is read or made without --sign.
+    let identity = if !args.sign {
         None
     } else {
         let dir = Identity::default_dir()
-            .ok_or("can't find your home folder to keep a signing key in; use --unsigned")?;
+            .ok_or("can't find your home folder to keep a signing key in; leave out --sign")?;
         let (identity, created) = Identity::load_or_create(&dir)?;
         if created {
             eprintln!(
