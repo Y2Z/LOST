@@ -54,12 +54,17 @@ lost -e rust.lost --sign rust     # the same, signed with your ID (exports are u
 - `site:`
 - `intitle:`
 - `allintitle:`
-- `inurl:`
+- `inurl:` (`inurl:gemini://`, `inurl:.onion/`)
 - `allinurl:`
 - `intext:`
 - `allintext:`
 - `filetype:`
 - `link:`
+- `contains:` (`contains:pdf`: pages linking to PDFs)
+- `related:` (`related:example.com`)
+- `lang:` / `language:` (`lang:de`, `language:german`)
+- `near:` (`catfish near:3 cornmeal`)
+- `word*` (`catf*`)
 
 
 ## Data
