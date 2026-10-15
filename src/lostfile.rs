@@ -320,8 +320,16 @@ impl<'a> Writer<'a, File> {
     /// without one), whoever signed it before. The file is complete again
     /// before this returns, and locked while the writer is open.
     pub fn append(path: &Path, identity: Option<&'a Identity>) -> Result<Writer<'a, File>> {
-        let mut reader = Reader::open(path)?;
-        let name = reader.name.clone();
+        let name = file_name(path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("can't write {}: {e}", path.display()))?;
+        // Locked before anything is read, and through this one handle until
+        // the writer is done: nothing else can write it in between.
+        lock(&file, &name)?;
+        let mut reader = Reader::from_file(file, name)?;
         let mut header = reader.header.clone();
         header.signer = identity.map(|i| to_hex(&i.public_key()));
         let header_bytes = serde_json::to_vec(&header)?;
@@ -332,10 +340,12 @@ impl<'a> Writer<'a, File> {
             .last()
             .map_or(reader.data_start, |c| c.offset + c.size);
 
-        if 10 + header_bytes.len() as u64 != reader.data_start {
+        let mut file = if 10 + header_bytes.len() as u64 != reader.data_start {
             // The header changes size (an unsigned file signed now, or the
             // other way round): the chunks move, so the file is written
-            // again next to the old one, then put in its place.
+            // again whole, first next to it (a complete copy, if this is
+            // interrupted), then over it, through the handle that holds the
+            // lock: it's never replaced under another program's feet.
             let partial = PathBuf::from(format!("{}.part", path.display()));
             let mut rewrite = || -> Result<u64> {
                 let mut out = File::create(&partial)
@@ -372,19 +382,27 @@ impl<'a> Writer<'a, File> {
                     return Err(e);
                 }
             }
-            drop(reader);
-            std::fs::rename(&partial, path)
-                .map_err(|e| format!("can't replace {}: {e}", path.display()))?;
+            let mut file = reader.into_file();
+            let copied = (|| -> Result<()> {
+                let mut copy = File::open(&partial)?;
+                file.seek(SeekFrom::Start(0))?;
+                let len = std::io::copy(&mut copy, &mut file)?;
+                file.set_len(len)?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            copied.map_err(|e| {
+                format!(
+                    "can't rewrite {} ({e}); a complete copy is in {}",
+                    path.display(),
+                    partial.display()
+                )
+            })?;
+            let _ = std::fs::remove_file(&partial);
+            file
         } else {
-            drop(reader);
-        }
-
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| format!("can't write {}: {e}", path.display()))?;
-        lock(&file, &name)?;
+            reader.into_file()
+        };
         file.seek(SeekFrom::Start(5))?;
         file.write_all(&[flags])?;
         file.seek(SeekFrom::Start(10))?;
@@ -442,12 +460,13 @@ impl Reader {
     /// it's signed. Fails with a message for the user if it's not a `.lost`
     /// file, is cut short, or was changed after it was signed.
     pub fn open(path: &Path) -> Result<Reader> {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        let mut file =
-            File::open(path).map_err(|e| format!("can't open {}: {e}", path.display()))?;
+        let file = File::open(path).map_err(|e| format!("can't open {}: {e}", path.display()))?;
+        Reader::from_file(file, file_name(path))
+    }
+
+    /// The same, for a file already open; `name` is for messages.
+    pub fn from_file(mut file: File, name: String) -> Result<Reader> {
+        file.seek(SeekFrom::Start(0))?;
         let len = file.metadata()?.len();
         let incomplete = || -> crate::Error {
             format!("{name} is incomplete (was the download cut short?)").into()
@@ -558,6 +577,11 @@ impl Reader {
         &self.name
     }
 
+    /// The open file, back.
+    pub fn into_file(self) -> File {
+        self.file
+    }
+
     pub fn header(&self) -> &Header {
         &self.header
     }
@@ -644,6 +668,12 @@ impl PackedChunk {
         }
         Some(chunk)
     }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn not_lost(name: &str) -> crate::Error {

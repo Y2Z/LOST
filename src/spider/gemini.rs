@@ -242,7 +242,7 @@ fn decode(bytes: &[u8], charset: Option<&str>) -> String {
     match charset {
         Some(
             "iso-8859-1" | "iso8859-1" | "latin1" | "latin-1" | "l1" | "windows-1252" | "cp1252",
-        ) => bytes.iter().map(|&b| b as char).collect(),
+        ) => crate::http::windows_1252(bytes),
         _ => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
@@ -334,6 +334,10 @@ mod tests {
         let m = "text/gemini; charset=ISO-8859-1; lang=en";
         assert_eq!(mime_type(m), "text/gemini");
         assert_eq!(charset(m).as_deref(), Some("iso-8859-1"));
+        assert_eq!(
+            decode(b"\x93\xe9\x94", Some("iso-8859-1")),
+            "\u{201c}é\u{201d}"
+        );
         assert!(is_text(m));
         assert!(!is_text("image/png"));
         assert_eq!(

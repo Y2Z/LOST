@@ -272,7 +272,7 @@ fn decode(body: &[u8], mime: &str) -> String {
         .iter()
         .any(|n| says(n));
     if latin1 && std::str::from_utf8(body).is_err() {
-        body.iter().map(|&b| b as char).collect()
+        windows_1252(body)
     } else {
         String::from_utf8_lossy(body).into_owned()
     }
@@ -368,7 +368,10 @@ fn attribute_value<'a>(original: &'a str, tag: &str, name: &str) -> Option<&'a s
 fn dechunk(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut at = 0;
-    while let Some(line_len) = find(&raw[at..], b"\r\n") {
+    while at < raw.len() {
+        let Some(line_len) = find(&raw[at..], b"\r\n") else {
+            break;
+        };
         let line = String::from_utf8_lossy(&raw[at..at + line_len]);
         let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
         else {
@@ -378,14 +381,32 @@ fn dechunk(raw: &[u8]) -> Vec<u8> {
         if size == 0 {
             break;
         }
-        let end = (at + size).min(raw.len());
+        // A size larger than what's left (or one that overflows) means a
+        // cut-off body: keep what there is and stop.
+        let end = at.saturating_add(size).min(raw.len());
         out.extend_from_slice(&raw[at..end]);
-        at = end + 2;
-        if at >= raw.len() {
-            break;
-        }
+        at = end.saturating_add(2);
     }
     out
+}
+
+/// Bytes in Windows-1252, which is also what every browser reads when a
+/// page says ISO-8859-1: 0x80–0x9F are curly quotes, dashes, € and so on
+/// rather than control characters. The five unassigned bytes stay as the
+/// code points of the same number.
+pub fn windows_1252(bytes: &[u8]) -> String {
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9f => HIGH[(b - 0x80) as usize],
+            _ => b as char,
+        })
+        .collect()
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -413,6 +434,29 @@ fn read(
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn chunks() {
+        assert_eq!(dechunk(b"3\r\nabc\r\n2;x=y\r\nde\r\n0\r\n\r\n"), b"abcde");
+        // Cut off in the middle of a chunk.
+        assert_eq!(dechunk(b"10\r\nabc"), b"abc");
+        // A size that would overflow keeps what's there and stops.
+        assert_eq!(dechunk(b"ffffffffffffffff\r\nabc"), b"abc");
+        assert_eq!(dechunk(b"2\r\nab\r\nffffffffffffffff\r\ncd"), b"abcd");
+        assert_eq!(dechunk(b"nonsense"), b"");
+    }
+
+    #[test]
+    fn windows_1252_text() {
+        assert_eq!(
+            windows_1252(b"\x93caf\xe9\x94 \x96 \x80 5 \x85\x81"),
+            "\u{201c}café\u{201d} \u{2013} € 5 …\u{81}"
+        );
+        assert_eq!(
+            decode(b"<meta charset=windows-1252>\x92", "text/html"),
+            "<meta charset=windows-1252>\u{2019}"
+        );
+    }
 
     /// A server answering one request with `answer`; returns what was asked.
     fn serve(answer: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {

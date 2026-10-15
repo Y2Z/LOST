@@ -149,16 +149,26 @@ impl Protocol for Gopher {
         })
     }
 
-    fn parse(&self, _url: &Url, mime: &str, body: &[u8]) -> Parsed {
+    fn parse(&self, url: &Url, mime: &str, body: &[u8]) -> Parsed {
         let text = decode(body);
         match mime {
             "application/gopher-menu" => menu(&text),
-            "text/html" => Parsed {
-                title: crate::http::html_title(&text),
-                body: lost::text::html_to_text(&text),
-                links: mentions(&text, Self::SCHEME),
-                skip: false,
-            },
+            "text/html" => {
+                // Links (only the gopher:// ones are kept by the crawler),
+                // plus gopher:// URLs written in the text.
+                let mut links = crate::http::html_links(url, &text);
+                for link in mentions(&text, Self::SCHEME) {
+                    if !links.iter().any(|l| l.url == link.url) {
+                        links.push(link);
+                    }
+                }
+                Parsed {
+                    title: crate::http::html_title(&text),
+                    body: lost::text::html_to_text(&text),
+                    links,
+                    skip: false,
+                }
+            }
             _ => {
                 // A text file ends with a line holding a dot.
                 let text = text.replace("\r\n", "\n");
@@ -295,7 +305,7 @@ fn is_error(body: &[u8]) -> bool {
 fn decode(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_string(),
-        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+        Err(_) => crate::http::windows_1252(bytes),
     }
 }
 
@@ -454,9 +464,16 @@ hMy website\tURL:https://example.com/\texample.org\t70\r
         let page = gopher().parse(
             &url("gopher://x/h/a.html"),
             "text/html",
-            b"<html><head><TITLE>My  page</TITLE></head><body><p>Hi</p></body></html>",
+            b"<html><head><TITLE>My  page</TITLE></head><body><p>Hi</p>\
+            <a href=\"gopher://y/1/menu\">menu</a> <a href=\"b.html\">b</a> \
+            <a href=\"https://z/\">web</a> see gopher://w/0/t.txt</body></html>",
         );
         assert_eq!(page.title.as_deref(), Some("My page"));
+        let links: Vec<&str> = page.links.iter().map(|l| l.url.as_str()).collect();
+        assert!(links.contains(&"gopher://y/1/menu"), "{links:?}");
+        assert!(links.contains(&"gopher://x/h/b.html"), "{links:?}");
+        assert!(links.contains(&"gopher://w/0/t.txt"), "{links:?}");
+        assert_eq!(decode(b"\x93hi\x94"), "\u{201c}hi\u{201d}");
         assert!(Gopher::is_search(
             "",
             Some("Search Veronica-2"),

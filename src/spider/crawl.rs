@@ -590,13 +590,15 @@ pub fn looks_like_posting(text: &str) -> bool {
     NOT.iter().any(|w| text.contains(w))
 }
 
-/// `host`, or `host:port` for a port that isn't the scheme's; punycode for
-/// an internationalized host, so both spellings are one host.
+/// A host, as robots.txt and politeness see it: `scheme://host`, with
+/// `:port` when it isn't the scheme's (so `http://` and `https://` on one
+/// name are two, each with its own robots.txt); punycode for an
+/// internationalized host, so both spellings are one host.
 pub fn host_key(url: &Url) -> String {
     let host = lost::urls::ascii_host(&url.host).unwrap_or_else(|| url.host.clone());
     match url.port {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
+        Some(port) => format!("{}://{host}:{port}", url.scheme),
+        None => format!("{}://{host}", url.scheme),
     }
 }
 
@@ -932,7 +934,9 @@ impl State {
         if let Some(task) = self.resolve_task() {
             return task;
         }
-        if self.active == 0 && self.unresolved.is_empty() {
+        // Done only when nothing runs, nothing waits to be looked up, and no
+        // server waits out its delay with something still to ask.
+        if self.active == 0 && self.unresolved.is_empty() && self.ready.is_empty() {
             Next::Done
         } else {
             Next::Wait(wait)
@@ -974,8 +978,9 @@ impl State {
                     server.hosts.push_back(key.clone());
                 }
                 if job.kind != Kind::Robots {
+                    // No rules read (yet): nothing is asked without them.
                     let path = (self.robots_path)(&job.url);
-                    if host.robots.as_ref().is_some_and(|r| !r.allows(&path)) {
+                    if host.robots.as_ref().is_none_or(|r| !r.allows(&path)) {
                         continue;
                     }
                     if settings.host_limit.is_some_and(|limit| host.saved >= limit) {
@@ -985,15 +990,15 @@ impl State {
                         continue;
                     }
                     if job.kind == Kind::Page && (self.is_file)(&job.url) {
+                        let title = fallback_title(&job.url, job.label.as_deref(), self.untitled);
+                        if settings.blacklist.blocks_page(Some(&title), "") {
+                            continue;
+                        }
                         host.saved += 1;
                         schedule(server, &name, &mut self.ready, &mut self.order);
                         self.active += 1;
                         return Ok(Next::Task(Box::new(Task::Save(Page {
-                            title: Some(fallback_title(
-                                &job.url,
-                                job.label.as_deref(),
-                                self.untitled,
-                            )),
+                            title: Some(title),
                             url: job.url.to_string(),
                             sources: vec![self.name.to_string()],
                             crawled: Some(lost::store::now()),
@@ -1055,16 +1060,17 @@ impl State {
         }
         match outcome {
             Outcome::Failed => {
-                let failures = self.hosts.get_mut(key).map_or(MAX_FAILURES, |host| {
-                    if job.kind == Kind::Robots {
-                        // No rules to go by: whatever comes next decides.
-                        host.robots = Some(Robots::default());
-                    }
-                    host.failures
-                });
+                let failures = self
+                    .hosts
+                    .get(key)
+                    .map_or(MAX_FAILURES, |host| host.failures);
                 if failures >= MAX_FAILURES {
                     self.retire(key);
-                } else if job.kind != Kind::Robots && job.tries == 0 {
+                } else if job.kind == Kind::Robots {
+                    // Asked again before anything else: nothing is fetched
+                    // there without its rules.
+                    self.requeue(key, job, true);
+                } else if job.tries == 0 {
                     self.requeue(key, Job { tries: 1, ..job }, false);
                 }
             }
@@ -1079,8 +1085,8 @@ impl State {
                 blocked,
                 links,
             } => {
-                let new = content.is_none_or(|c| self.contents.insert(c));
-                if new && !blocked {
+                let new = !blocked && content.is_none_or(|c| self.contents.insert(c));
+                if new {
                     if let Some(host) = self.hosts.get_mut(key) {
                         host.saved += 1;
                     }
@@ -1103,6 +1109,13 @@ impl State {
             }
             Outcome::Redirect(url) => {
                 if job.hops < MAX_HOPS {
+                    // A redirect to a spelling of the same URL (`/dir` to
+                    // `/dir/`, a host to its `/`) counts as seen already:
+                    // let it through, the hop limit stops loops.
+                    let target = seen_key(&url);
+                    if target == seen_key(&job.url) {
+                        self.seen.remove(&target);
+                    }
                     self.enqueue(url, job.label, job.kind, job.hops + 1, settings);
                 }
             }
@@ -1121,7 +1134,9 @@ impl State {
             Outcome::Follow(_) => {}
             Outcome::SlowDown(wait) => {
                 next = now + wait.max(settings.delay);
-                if job.tries < 3 {
+                if job.tries >= 3 && job.kind == Kind::Robots {
+                    self.retire(key);
+                } else if job.tries < 3 {
                     self.requeue(
                         key,
                         Job {
@@ -1133,6 +1148,7 @@ impl State {
                 }
             }
             Outcome::Retry => {
+                let robots = job.kind == Kind::Robots;
                 if job.tries < 2 {
                     self.requeue(
                         key,
@@ -1140,8 +1156,11 @@ impl State {
                             tries: job.tries + 1,
                             ..job
                         },
-                        false,
+                        robots,
                     );
+                } else if robots {
+                    // Its rules never came: nothing more is asked there.
+                    self.retire(key);
                 }
             }
             Outcome::Nothing => {}
@@ -1327,6 +1346,10 @@ impl<P: Protocol> Crawler<P> {
                 Response::Document {
                     body: Some(body), ..
                 } => Outcome::Robots(Robots::parse(&String::from_utf8_lossy(&body))),
+                // Not now: asked again first, nothing else meanwhile.
+                Response::TryLater => Outcome::Retry,
+                Response::SlowDown(wait) => Outcome::SlowDown(wait),
+                // None there (not found, moved, not text…): no rules.
                 _ => Outcome::Robots(Robots::default()),
             };
         }
@@ -1337,6 +1360,14 @@ impl<P: Protocol> Crawler<P> {
             } => {
                 let parsed = self.protocol.parse(&job.url, &mime, &body);
                 if job.kind == Kind::Results || parsed.skip {
+                    // Followed, not saved — unless the blacklist says no.
+                    if self
+                        .settings
+                        .blacklist
+                        .blocks_page(parsed.title.as_deref(), &parsed.body)
+                    {
+                        return Outcome::Nothing;
+                    }
                     return Outcome::Follow(parsed.links);
                 }
                 let title = parsed.title.unwrap_or_else(|| {
@@ -1365,22 +1396,21 @@ impl<P: Protocol> Crawler<P> {
                     links: parsed.links,
                 }
             }
-            Response::Document { body: None, .. } => Outcome::Page {
-                page: Page {
-                    url: job.url.to_string(),
-                    sources: vec![P::NAME.to_string()],
-                    title: Some(fallback_title(
-                        &job.url,
-                        job.label.as_deref(),
-                        P::fallback_title,
-                    )),
-                    crawled: Some(lost::store::now()),
-                    ..Page::default()
-                },
-                content: None,
-                blocked: false,
-                links: Vec::new(),
-            },
+            Response::Document { body: None, .. } => {
+                let title = fallback_title(&job.url, job.label.as_deref(), P::fallback_title);
+                Outcome::Page {
+                    blocked: self.settings.blacklist.blocks_page(Some(&title), ""),
+                    page: Page {
+                        url: job.url.to_string(),
+                        sources: vec![P::NAME.to_string()],
+                        title: Some(title),
+                        crawled: Some(lost::store::now()),
+                        ..Page::default()
+                    },
+                    content: None,
+                    links: Vec::new(),
+                }
+            }
             Response::Redirect(target) => match lost::urls::resolve_any(&job.url, &target) {
                 Some(url) => Outcome::Redirect(url),
                 None => Outcome::Nothing,
@@ -1531,7 +1561,11 @@ mod tests {
         );
         let idn = clean(Url::parse("gemini://Café.example/x").unwrap());
         assert_eq!(idn.host, "café.example");
-        assert_eq!(host_key(&idn), "xn--caf-dma.example");
+        assert_eq!(host_key(&idn), "gemini://xn--caf-dma.example");
+        assert_ne!(
+            host_key(&Url::parse("http://x.onion/").unwrap()),
+            host_key(&Url::parse("https://x.onion/").unwrap())
+        );
         assert_eq!(
             on_the_wire(&idn).to_string(),
             "gemini://xn--caf-dma.example/x"
@@ -1562,9 +1596,19 @@ mod tests {
         fn fetch(&self, route: Route, url: &Url) -> Result<Response, String> {
             assert_eq!(matches!(route, Route::Proxied), self.proxied);
             let url = url.to_string();
-            self.asked.lock().unwrap().push(url.clone());
+            let mut asked = self.asked.lock().unwrap();
+            let before = asked.iter().filter(|u| **u == url).count();
+            asked.push(url.clone());
+            drop(asked);
             if url.contains("down.test") {
                 return Err("unreachable".into());
+            }
+            // flaky.test's rules fail twice before they come; shy.test's
+            // never do.
+            if url == "gemini://flaky.test/robots.txt" && before < 2
+                || url == "gemini://shy.test/robots.txt"
+            {
+                return Err("timed out".into());
             }
             Ok(self.pages.get(&url).cloned().unwrap_or(Response::Gone))
         }
@@ -1898,5 +1942,78 @@ mod tests {
         };
         let (saved, _) = crawl(pages, limited, Known::default(), &["gemini://a.test/"]);
         assert_eq!(saved.len(), 2);
+    }
+
+    #[test]
+    fn waiting_out_the_delay() {
+        // One host and a delay between asks: the crawl waits for it rather
+        // than ending while the only server is resting.
+        let pages = vec![
+            ("gemini://a.test/", doc("Home =>/1 =>/2")),
+            ("gemini://a.test/1", doc("One")),
+            ("gemini://a.test/2", doc("Two")),
+        ];
+        let slow = Settings {
+            delay: Duration::from_millis(150),
+            ..settings()
+        };
+        let (saved, _) = crawl(pages, slow, Known::default(), &["gemini://a.test/"]);
+        let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["gemini://a.test/", "gemini://a.test/1", "gemini://a.test/2"]
+        );
+    }
+
+    #[test]
+    fn redirects_to_another_spelling() {
+        let pages = vec![
+            ("gemini://a.test/", doc("Home =>/dir")),
+            ("gemini://a.test/dir", Response::Redirect("/dir/".into())),
+            ("gemini://a.test/dir/", doc("Inside")),
+        ];
+        let (saved, asked) = crawl(pages, settings(), Known::default(), &["gemini://a.test/"]);
+        let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(urls, ["gemini://a.test/", "gemini://a.test/dir/"]);
+        assert_eq!(asked.iter().filter(|u| u.ends_with("/dir/")).count(), 1);
+    }
+
+    #[test]
+    fn rules_that_fail() {
+        let pages = vec![
+            ("gemini://flaky.test/", doc("Flaky =>/private/x")),
+            (
+                "gemini://flaky.test/robots.txt",
+                doc("User-agent: *\nDisallow: /private/"),
+            ),
+            ("gemini://flaky.test/private/x", doc("Hidden")),
+            ("gemini://shy.test/", doc("Shy")),
+        ];
+        let (saved, asked) = crawl(
+            pages,
+            settings(),
+            Known::default(),
+            &["gemini://flaky.test/", "gemini://shy.test/"],
+        );
+        let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+        // flaky.test's rules were asked for again until they came, and
+        // kept; shy.test's never came, so nothing there was asked for.
+        assert_eq!(urls, ["gemini://flaky.test/"]);
+        assert!(!asked.iter().any(|u| u.contains("private")));
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|u| *u == "gemini://flaky.test/robots.txt")
+                .count(),
+            3
+        );
+        assert!(!asked.contains(&"gemini://shy.test/".to_string()));
+        assert!(
+            asked
+                .iter()
+                .filter(|u| *u == "gemini://shy.test/robots.txt")
+                .count()
+                <= MAX_FAILURES as usize
+        );
     }
 }

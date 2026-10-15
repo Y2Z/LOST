@@ -515,7 +515,11 @@ fn with_number(path: &Path, n: u32) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let split = name.len().saturating_sub(5);
-    let (stem, extension) = if name.len() > 5 && name[split..].eq_ignore_ascii_case(".lost") {
+    let lost = name.len() > 5
+        && name
+            .get(split..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(".lost"));
+    let (stem, extension) = if lost {
         name.split_at(split)
     } else {
         (name.as_str(), "")
@@ -584,6 +588,15 @@ mod tests {
         assert_eq!(
             with_number(Path::new("crawl"), 1),
             PathBuf::from("crawl (1)")
+        );
+        // The last five bytes fall inside a character: no panic.
+        assert_eq!(
+            with_number(Path::new("пауки"), 1),
+            PathBuf::from("пауки (1)")
+        );
+        assert_eq!(
+            with_number(Path::new("пауки.lost"), 3),
+            PathBuf::from("пауки (3).lost")
         );
     }
 

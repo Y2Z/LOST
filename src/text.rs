@@ -24,14 +24,18 @@ pub fn html_to_text(html: &str) -> String {
         if rest.starts_with('<') {
             match rest.find('>') {
                 Some(end) => {
-                    let tag = tag_name(&rest[1..end]);
+                    let inside = &rest[1..end];
+                    let tag = tag_name(inside);
+                    // `<svg/>` closes itself (SVG is foreign content, where
+                    // that works); in HTML a `/` on `<script/>` and the
+                    // rest means nothing, so they still run to their end.
+                    let closed = tag == "svg" && inside.trim_end().ends_with('/');
                     rest = &rest[end + 1..];
                     match tag.as_str() {
-                        "script" | "style" | "svg" | "template" | "noembed" => {
+                        "script" | "style" | "svg" | "template" | "noembed" if !closed => {
                             // Up to the closing tag, which is all that ends them.
-                            let lower = rest.to_ascii_lowercase();
                             let close = format!("</{tag}");
-                            rest = match lower.find(&close) {
+                            rest = match find_ignoring_case(rest, &close) {
                                 Some(at) => match rest[at..].find('>') {
                                     Some(gt) => &rest[at + gt + 1..],
                                     None => "",
@@ -45,9 +49,9 @@ pub fn html_to_text(html: &str) -> String {
                         | "blockquote" | "/blockquote" | "section" | "/section" | "article"
                         | "/article" | "header" | "/header" | "footer" | "/footer" | "nav"
                         | "/nav" | "main" | "/main" | "aside" | "/aside" | "form" | "/form"
-                        | "dl" | "/dl" | "dt" | "dd" | "hr" | "hr/" | "figure" | "/figure"
-                        | "title" | "/title" => push_break(&mut out, 2),
-                        "br" | "br/" => push_break(&mut out, 1),
+                        | "dl" | "/dl" | "dt" | "dd" | "hr" | "figure" | "/figure" | "title"
+                        | "/title" => push_break(&mut out, 2),
+                        "br" => push_break(&mut out, 1),
                         "td" | "th" if !out.is_empty() && !out.ends_with(char::is_whitespace) => {
                             out.push(' ')
                         }
@@ -83,7 +87,16 @@ fn tag_name(inside: &str) -> String {
     let end = inside
         .find(|c: char| c.is_whitespace())
         .unwrap_or(inside.len());
-    inside[..end].to_ascii_lowercase()
+    inside[..end].trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Where an ASCII `needle` first appears in `haystack`, in any case,
+/// without copying the haystack.
+fn find_ignoring_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn push_break(out: &mut String, newlines: usize) {
@@ -405,6 +418,12 @@ mod tests {
         assert_eq!(html_to_text(html), "T\n\nHeading\n\nText\n\na b\n\nend");
         assert_eq!(html_to_text("a<!-- never closed"), "a");
         assert_eq!(html_to_text("a<script>never closed"), "a");
+        // A self-closing SVG hides nothing after it; an SVG with content
+        // hides its content.
+        assert_eq!(html_to_text("a<svg/>b<p>c"), "ab\n\nc");
+        assert_eq!(html_to_text("a<svg viewBox=\"0 0 1 1\" />b"), "ab");
+        assert_eq!(html_to_text("a<SVG><text>x</text></Svg>b"), "ab");
+        assert_eq!(html_to_text("a<br/>b<hr/>c"), "a\nb\n\nc");
     }
 
     #[test]
