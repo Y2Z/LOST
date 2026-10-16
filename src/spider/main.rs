@@ -15,6 +15,7 @@ mod ipfs;
 mod net;
 mod nostr;
 mod onion;
+mod ton;
 mod websocket;
 
 use std::io::IsTerminal;
@@ -38,6 +39,7 @@ use crate::ipfs::Ipfs;
 use crate::net::Proxy;
 use crate::nostr::Nostr;
 use crate::onion::Onion;
+use crate::ton::Ton;
 
 const USAGE: &str = "\
 lost-spider — LOST's crawler. It crawls a network and saves what it finds
@@ -53,6 +55,7 @@ Usage:
   lost-spider arweave [OPTIONS]   Crawl Arweave (the permaweb), through a gateway
   lost-spider nostr [OPTIONS]     Crawl Nostr: notes, articles and profiles,
                                   from relays
+  lost-spider ton [OPTIONS]       Crawl TON Sites, through a TON proxy
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -84,8 +87,9 @@ Options:
       --host-limit N      Save at most N pages from one host (default: no limit)
       --proxy URL         Go through a proxy: socks5://HOST:PORT (any network;
                           Tor's is socks5://127.0.0.1:9050) or http://HOST:PORT
-                          (I2P, or an http:// IPFS gateway). onion uses Tor's
-                          by default, i2p http://127.0.0.1:4444
+                          (I2P, TON, or an http:// IPFS gateway). onion uses
+                          Tor's by default, i2p http://127.0.0.1:4444, ton
+                          http://127.0.0.1:8080
       --gateway URL       ipfs, arweave: the gateway to ask (defaults: ipfs
                           http://127.0.0.1:8080, Kubo's; arweave
                           https://turbo-gateway.com). One that isn't on this
@@ -93,7 +97,7 @@ Options:
   -t, --timeout SECONDS   How long to wait for a server to connect or send more
                           (a whole page gets four times that). Defaults: gopher
                           10, gemini 15, either through a proxy 30, nostr 20,
-                          arweave 30, onion 60, ipfs 60, i2p 120
+                          arweave 30, onion 60, ipfs 60, ton 60, i2p 120
   -h, --help              Show this help
   -V, --version           Show the version
 
@@ -158,11 +162,12 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
         "arweave" => start(&args[1..], |o| {
             Arweave::new(o.gateway.take(), o.proxy.take(), o.timeout)
         }),
+        "ton" => start(&args[1..], |o| Ton::new(o.proxy.take(), o.timeout)),
         "nostr" => start(&args[1..], |o| {
             Nostr::new(o.proxy.take(), o.timeout, o.delay, o.searches.clone())
         }),
         other => Err(format!(
-            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr)"
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr, ton)"
         )
         .into()),
     }
@@ -307,6 +312,7 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
             let hint = match P::NAME {
                 "onion" => " (is Tor running?)",
                 "i2p" => " (is the I2P router running?)",
+                "ton" => " (is the TON proxy running?)",
                 _ => "",
             };
             format!("{e}{hint}")

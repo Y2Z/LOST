@@ -799,6 +799,7 @@ lost/
         ├── ipfs.rs           IPFS through a gateway; CIDs, one way to write them
         ├── arweave.rs        Arweave through a gateway; GraphQL listings, ArNS
         ├── nostr.rs          Nostr relays: listings, posts, profiles, NIP-19
+        ├── ton.rs            TON Sites through a TON proxy
         └── websocket.rs      WebSocket (RFC 6455), for Nostr relays
 ```
 
@@ -857,7 +858,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
                     [--host-limit N] [--proxy URL] [--gateway URL] [-t SECONDS]
 ```
 
-`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7), `arweave` (§15.8) or `nostr` (§15.9); the options are the same for each, but for `--gateway`, which is `ipfs`'s and `arweave`'s.
+`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7), `arweave` (§15.8), `nostr` (§15.9) or `ton` (§15.10); the options are the same for each, but for `--gateway`, which is `ipfs`'s and `arweave`'s.
 
 | Option | What it does |
 |---|---|
@@ -870,9 +871,9 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`; `nostr:…` URIs are URL beginnings too, and for `nostr` an `npub1…`, `nostr:npub1…` or `nprofile1…` is an author whose posts are all skipped, §15.9). Skipped pages aren't saved and their links aren't followed |
 | `--delay SECONDS` | Between two requests to the same server (for `nostr`, the same relay); default 1, decimals allowed |
 | `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
-| `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
+| `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`, `ton` `http://127.0.0.1:8080`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
 | `--gateway URL` | `ipfs` and `arweave`: the gateway to ask, `http://HOST:PORT` or `https://HOST` (`arweave`: default `https://turbo-gateway.com`, §15.8; `ipfs`: default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
-| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Nostr 20 s, Arweave 30 s, IPFS 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
+| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Nostr 20 s, Arweave 30 s, IPFS 60 s, TON 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Unsigned ("Saving to NAME, unsigned."), or with `--sign` signed with your ID ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."). If `--sign` is given and the ID can't be read or made, the spider stops before crawling rather than leave the file unsigned.
@@ -991,6 +992,15 @@ Nostr has no sites: posts ("events", NIP-01) are signed by their authors and kep
 - **WebSocket:** RFC 6455's client side, as much as relays need: the HTTP upgrade (`101`), masked frames out, text messages in (in parts, too), pings answered; no compression. TLS accepts any certificate (§15.6): what's checked is the posts' signatures. `--proxy socks5://…` (Tor) works, and reaches `.onion` relays; an HTTP proxy doesn't.
 - **No robots.txt:** relays are servers for programs, and posts aren't sites.
 - Before crawling, the seeds are connected to at once: "Reached N of 6 relays." None at all stops the spider. Default timeout 20 s (a whole answer gets four times that).
+
+### 15.10 TON Sites (`ton.rs`)
+
+TON Sites are web sites on TON's network, served over RLDP (TON's own transport) and reached through a TON proxy, an HTTP proxy on this computer: `rldp-http-proxy` (`rldp-http-proxy -p 8080 -c 3333 -C global.config.json`) or Tonutils Proxy, at `http://127.0.0.1:8080` by default (`--proxy` for another; Kubo's gateway, §15.7, wants that port too).
+
+- **Addresses:** `http://NAME.ton/` (TON DNS names, subdomains too), `http://ADDRESS.adnl/` (a site by its ADNL address) and `http://BAG.bag/` (TON Storage). Only those are crawled: the proxy sends any other host to the ordinary web, so links to anything else (`https://`, gateways such as `NAME.ton.website`) aren't followed.
+- **Seeds:** foundation.ton, storage.ton, howtorunsite.ton, tondnsdomain.ton.
+- **Pages** as in §15.6 (HTML and text); robots.txt is obeyed. An answer of 500 or more is the proxy's (it couldn't reach the site): the site counts as unreachable.
+- **Waiting for the proxy:** before crawling, foundation.ton is asked for until it answers, for up to 5 minutes ("Waiting for the TON proxy to be able to reach sites…"); a proxy that isn't running at all stops the spider at once (is the TON proxy running?). Default timeout 60 s.
 
 ---
 
