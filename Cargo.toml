@@ -37,7 +37,7 @@ server = ["dep:axum", "dep:tokio", "dep:libc"]
 # egui desktop app and tray icon.
 gui = ["cli", "dep:eframe", "dep:rfd", "dep:ksni", "dep:winit", "dep:tray-icon", "dep:windows-sys"]
 # lost-spider. Not in the default set: only the spider goes online.
-spider = ["dep:rustls", "dep:ctrlc", "dep:regex"]
+spider = ["dep:rustls", "dep:ctrlc", "dep:regex", "dep:k256"]
 
 [dependencies]
 blake3 = "1"
@@ -76,6 +76,8 @@ getrandom = "0.4"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 ctrlc = { version = "3.4", optional = true, features = ["termination"] }
 regex = { version = "1", optional = true }
+# lost-spider nostr: checking posts' signatures (BIP-340 Schnorr, secp256k1).
+k256 = { version = "0.14", optional = true, default-features = false, features = ["schnorr"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }

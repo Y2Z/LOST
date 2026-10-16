@@ -232,6 +232,8 @@ pub struct Settings {
 /// title:/free bitcoin/           # … on the title
 /// body:/some phrase/             # … on the text
 /// 0.0.0.0 tracker.example        # hosts-file lines work too
+/// nostr:npub1…                   # a Nostr URI: what starts with it (and,
+///                                # for lost-spider nostr, an author's posts)
 /// ```
 #[derive(Default)]
 pub struct Blacklist {
@@ -282,7 +284,7 @@ impl Blacklist {
                 let line = without_comment(line);
                 let mut words = line.split_whitespace();
                 let Some(first) = words.next() else { continue };
-                if first.contains("://") {
+                if first.contains("://") || first.to_ascii_lowercase().starts_with("nostr:") {
                     // Written the way the spider writes URLs, so they compare.
                     let prefix = match Url::parse(first) {
                         Some(url) if first.ends_with('/') || url.path != "/" => url.to_string(),
@@ -337,6 +339,16 @@ impl Blacklist {
         }
         self.prefixes.iter().any(|p| text.starts_with(p.as_str()))
             || self.urls.iter().any(|r| r.is_match(text))
+    }
+
+    /// What's listed by name: domains (and bare names) and URL beginnings,
+    /// as written down. A protocol can find its own kinds of names there
+    /// (Nostr's authors).
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.domains
+            .iter()
+            .map(String::as_str)
+            .chain(self.prefixes.iter().map(String::as_str))
     }
 
     fn blocks_page(&self, title: Option<&str>, body: &str) -> bool {
@@ -524,7 +536,7 @@ fn clean(mut url: Url) -> Url {
 
 /// What a search box is sent: everything but letters, digits and `-._~`
 /// percent-encoded.
-fn encode_query(text: &str) -> String {
+pub fn encode_query(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 3);
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {

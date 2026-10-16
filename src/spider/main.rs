@@ -13,7 +13,9 @@ mod http;
 mod i2p;
 mod ipfs;
 mod net;
+mod nostr;
 mod onion;
+mod websocket;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -34,6 +36,7 @@ use crate::gopher::Gopher;
 use crate::i2p::I2p;
 use crate::ipfs::Ipfs;
 use crate::net::Proxy;
+use crate::nostr::Nostr;
 use crate::onion::Onion;
 
 const USAGE: &str = "\
@@ -48,6 +51,8 @@ Usage:
   lost-spider ipfs [OPTIONS]      Crawl IPFS sites (and ENS names), through an
                                   IPFS node's gateway
   lost-spider arweave [OPTIONS]   Crawl Arweave (the permaweb), through a gateway
+  lost-spider nostr [OPTIONS]     Crawl Nostr: notes, articles and profiles,
+                                  from relays
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -67,13 +72,15 @@ Options:
                           links: to add those pages to a file, and nothing else
       --search PHRASE     Type PHRASE into the search boxes found, and crawl
                           what they find (repeat for more). Only boxes that
-                          look like searches; never comment or password boxes
+                          look like searches; never comment or password boxes.
+                          nostr: searched for on the relays that can search
       --searches FILE     The same, one phrase a line
       --blacklist FILE    Skip URLs and pages that FILE lists, in this crawl
                           (domains, URL beginnings, /regex/, title:/regex/,
-                          body:/regex/; # starts a comment)
-      --delay SECONDS     Wait between two requests to the same server
-                          (default 1; decimals allowed)
+                          body:/regex/, nostr: npub1… for an author's posts;
+                          # starts a comment)
+      --delay SECONDS     Wait between two requests to the same server (or
+                          Nostr relay) (default 1; decimals allowed)
       --host-limit N      Save at most N pages from one host (default: no limit)
       --proxy URL         Go through a proxy: socks5://HOST:PORT (any network;
                           Tor's is socks5://127.0.0.1:9050) or http://HOST:PORT
@@ -85,8 +92,8 @@ Options:
                           computer is asked one thing at a time
   -t, --timeout SECONDS   How long to wait for a server to connect or send more
                           (a whole page gets four times that). Defaults: gopher
-                          10, gemini 15, either through a proxy 30, arweave 30,
-                          onion 60, ipfs 60, i2p 120
+                          10, gemini 15, either through a proxy 30, nostr 20,
+                          arweave 30, onion 60, ipfs 60, i2p 120
   -h, --help              Show this help
   -V, --version           Show the version
 
@@ -151,8 +158,11 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
         "arweave" => start(&args[1..], |o| {
             Arweave::new(o.gateway.take(), o.proxy.take(), o.timeout)
         }),
+        "nostr" => start(&args[1..], |o| {
+            Nostr::new(o.proxy.take(), o.timeout, o.delay, o.searches.clone())
+        }),
         other => Err(format!(
-            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave)"
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr)"
         )
         .into()),
     }
@@ -262,7 +272,8 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
 /// network's scheme).
 fn link<P: Protocol>(text: &str) -> lost::Result<String> {
     let text = text.trim();
-    let full = if text.contains("://") {
+    // `nostr:npub1…` has no `//`.
+    let full = if text.contains("://") || Url::parse(text).is_some() {
         text.to_string()
     } else {
         format!("{}://{text}", P::SCHEME)
@@ -689,6 +700,27 @@ mod tests {
         assert!(parse_options::<Onion>(&args(&["--link", "example.org"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--proxy", "localhost:9050"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["-t", "0"])).is_err());
+        // Nostr's links: a URI, a bare entity, a relay.
+        let npub = "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg";
+        let o = parse_options::<Nostr>(&args(&[
+            "--link",
+            &format!("nostr:{npub}"),
+            "--link",
+            npub,
+            "--link",
+            "wss://relay.example",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            o.links,
+            [
+                format!("nostr:{npub}"),
+                format!("nostr:{npub}"),
+                "wss://relay.example/".to_string()
+            ]
+        );
+        assert!(parse_options::<Nostr>(&args(&["--link", "https://example.org/"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["-c"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--dont-crawl"])).is_err());
         let o = parse_options::<Gemini>(&args(&["--dont-crawl", "--link", "a.org"]));

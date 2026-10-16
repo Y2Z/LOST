@@ -70,12 +70,18 @@ impl Http {
     }
 
     pub fn get(&self, route: Route, url: &Url) -> Result<Answer, String> {
-        self.request(route, url, None, false)
+        self.request(route, url, None, false, None)
     }
 
     /// GET, the answer's body read whatever its type (an API's JSON, say).
     pub fn get_data(&self, route: Route, url: &Url) -> Result<Answer, String> {
-        self.request(route, url, None, true)
+        self.request(route, url, None, true, None)
+    }
+
+    /// GET asking for one type (`Accept`), the body read whatever its type:
+    /// a Nostr relay's information document, say.
+    pub fn get_as(&self, route: Route, url: &Url, accept: &str) -> Result<Answer, String> {
+        self.request(route, url, None, true, Some(accept))
     }
 
     /// POSTs `body` (of type `content_type`); the answer's body is read
@@ -87,7 +93,7 @@ impl Http {
         content_type: &str,
         body: &[u8],
     ) -> Result<Answer, String> {
-        self.request(route, url, Some((content_type, body)), true)
+        self.request(route, url, Some((content_type, body)), true, None)
     }
 
     fn request(
@@ -96,6 +102,7 @@ impl Http {
         url: &Url,
         upload: Option<(&str, &[u8])>,
         any_body: bool,
+        accept: Option<&str>,
     ) -> Result<Answer, String> {
         let https = url.scheme == "https";
         let via_http_proxy = route == Route::Proxied && matches!(self.proxy, Some(Proxy::Http(_)));
@@ -137,9 +144,10 @@ impl Http {
             ),
             None => ("GET", String::new()),
         };
+        let accept = accept.unwrap_or("text/html, text/plain;q=0.9, */*;q=0.5");
         let request = format!(
             "{method} {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: lost-spider/{}\r\n\
-             Accept: text/html, text/plain;q=0.9, */*;q=0.5\r\nAccept-Encoding: gzip\r\n\
+             Accept: {accept}\r\nAccept-Encoding: gzip\r\n\
              {extra}Connection: close\r\n\r\n",
             env!("CARGO_PKG_VERSION")
         );
