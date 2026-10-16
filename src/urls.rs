@@ -14,9 +14,10 @@ const TRACKING_PARAMS: &[&str] = &[
 pub struct Url {
     /// Lowercase scheme, e.g. `https`.
     pub scheme: String,
-    /// Lowercase host, without port or credentials. Except for `ipfs://` and
-    /// `ipns://`, whose "hosts" are content IDs and keys, where `Qm…` and
-    /// `12D3Koo…` (base58) mean something else in another case.
+    /// Lowercase host, without port or credentials. Except for `ipfs://`,
+    /// `ipns://` and `ar://`, whose "hosts" are content IDs, keys and
+    /// Arweave transaction IDs, which mean something else in another case
+    /// (`Qm…`, `12D3Koo…` in base58; Arweave's in base64).
     pub host: String,
     /// Port, if one was given and it isn't the scheme's default.
     pub port: Option<u16>,
@@ -57,7 +58,7 @@ impl Url {
         // Drop credentials.
         let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
 
-        let keep_case = matches!(scheme.as_str(), "ipfs" | "ipns");
+        let keep_case = keeps_case(&scheme);
         let fold = |host: &str| {
             if keep_case {
                 host.to_string()
@@ -306,6 +307,21 @@ fn uppercase_escapes(s: &str) -> String {
     out
 }
 
+/// Whether a scheme's hosts are case-sensitive: content IDs and keys
+/// (`ipfs://`, `ipns://`, `ar://`), where `Qm…` and `qm…` are two things.
+pub fn keeps_case(scheme: &str) -> bool {
+    matches!(scheme, "ipfs" | "ipns" | "ar")
+}
+
+/// The host of `url` as it's looked up and sent: [`ascii_host`]'s, but
+/// untouched for a scheme whose hosts keep their case.
+pub fn wire_host(url: &Url) -> Option<String> {
+    if keeps_case(&url.scheme) {
+        return (!url.host.is_empty()).then(|| url.host.clone());
+    }
+    ascii_host(&url.host)
+}
+
 /// A host name as it's looked up and sent: internationalized labels in
 /// punycode (`café.example` → `xn--caf-dma.example`), lowercase. ASCII
 /// names (and `[IPv6]` literals) come back lowercased. `None` for a name
@@ -478,6 +494,16 @@ mod tests {
             Url::parse("https://Example.COM/").unwrap().host,
             "example.com"
         );
+        let tx = "bNbA3TEQVL60xlgCcqdz4ZPHFZ711cZ3hmkpGttDt_U";
+        assert_eq!(Url::parse(&format!("ar://{tx}/")).unwrap().host, tx);
+        // And as they're sent.
+        let url = Url::parse(&format!("ar://{tx}/")).unwrap();
+        assert_eq!(wire_host(&url).as_deref(), Some(tx));
+        let url = Url::parse(&format!("ipfs://{cid}/")).unwrap();
+        assert_eq!(wire_host(&url).as_deref(), Some(cid));
+        let mut url = Url::parse("gemini://example.org/").unwrap();
+        url.host = "Example.ORG".into();
+        assert_eq!(wire_host(&url).as_deref(), Some("example.org"));
     }
 
     #[test]

@@ -70,6 +70,33 @@ impl Http {
     }
 
     pub fn get(&self, route: Route, url: &Url) -> Result<Answer, String> {
+        self.request(route, url, None, false)
+    }
+
+    /// GET, the answer's body read whatever its type (an API's JSON, say).
+    pub fn get_data(&self, route: Route, url: &Url) -> Result<Answer, String> {
+        self.request(route, url, None, true)
+    }
+
+    /// POSTs `body` (of type `content_type`); the answer's body is read
+    /// whatever its type (an API's JSON, say).
+    pub fn post(
+        &self,
+        route: Route,
+        url: &Url,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<Answer, String> {
+        self.request(route, url, Some((content_type, body)), true)
+    }
+
+    fn request(
+        &self,
+        route: Route,
+        url: &Url,
+        upload: Option<(&str, &[u8])>,
+        any_body: bool,
+    ) -> Result<Answer, String> {
         let https = url.scheme == "https";
         let via_http_proxy = route == Route::Proxied && matches!(self.proxy, Some(Proxy::Http(_)));
         if https && via_http_proxy {
@@ -100,14 +127,25 @@ impl Http {
             Some(port) => format!("{}:{port}", url.host),
             None => url.host.clone(),
         };
+        let (method, extra) = match upload {
+            Some((content_type, body)) => (
+                "POST",
+                format!(
+                    "Content-Type: {content_type}\r\nContent-Length: {}\r\n",
+                    body.len()
+                ),
+            ),
+            None => ("GET", String::new()),
+        };
         let request = format!(
-            "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: lost-spider/{}\r\n\
+            "{method} {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: lost-spider/{}\r\n\
              Accept: text/html, text/plain;q=0.9, */*;q=0.5\r\nAccept-Encoding: gzip\r\n\
-             Connection: close\r\n\r\n",
+             {extra}Connection: close\r\n\r\n",
             env!("CARGO_PKG_VERSION")
         );
         stream
             .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(upload.map_or(&[][..], |(_, body)| body)))
             .and_then(|()| stream.flush())
             .map_err(|e| e.to_string())?;
 
@@ -145,7 +183,8 @@ impl Http {
             body: Vec::new(),
         };
 
-        let limit = if (200..300).contains(&status) && is_text(&answer.content_type()) {
+        let wanted = any_body || is_text(&answer.content_type());
+        let limit = if (200..300).contains(&status) && wanted {
             MAX_BODY
         } else if status >= 400 {
             MAX_ERROR_BODY
@@ -481,6 +520,57 @@ mod tests {
 
     fn url(text: &str) -> Url {
         Url::parse(text).unwrap()
+    }
+
+    #[test]
+    fn posting() {
+        // A server that reads the whole request, body too, as servers do.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            let length: usize = request
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"data\":1}")
+                .unwrap();
+            (request, body)
+        });
+        let http = Http::new(None, Duration::from_secs(5)).unwrap();
+        let answer = http
+            .post(
+                Route::Direct(addr),
+                &url("http://gateway.example/graphql"),
+                "application/json",
+                b"{\"query\":\"x\"}",
+            )
+            .unwrap();
+        // JSON isn't text, but what was asked for is read all the same.
+        assert_eq!(answer.body, b"{\"data\":1}");
+        let (request, body) = server.join().unwrap();
+        assert!(
+            request.starts_with("POST /graphql HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("Content-Type: application/json\r\n"),
+            "{request}"
+        );
+        assert_eq!(body, b"{\"query\":\"x\"}");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! LOST's library for the `.lost` format and your ID, and nothing in LOST
 //! knows it exists.
 
+mod arweave;
 mod crawl;
 mod gemini;
 mod gopher;
@@ -26,6 +27,7 @@ use lost::lostfile::{Reader, Writer};
 use lost::text::{format_bytes, thousands};
 use lost::urls::Url;
 
+use crate::arweave::Arweave;
 use crate::crawl::{Blacklist, Crawler, Known, Protocol, Settings};
 use crate::gemini::Gemini;
 use crate::gopher::Gopher;
@@ -45,6 +47,7 @@ Usage:
   lost-spider i2p [OPTIONS]       Crawl I2P sites, through an I2P router
   lost-spider ipfs [OPTIONS]      Crawl IPFS sites (and ENS names), through an
                                   IPFS node's gateway
+  lost-spider arweave [OPTIONS]   Crawl Arweave (the permaweb), through a gateway
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -76,13 +79,14 @@ Options:
                           Tor's is socks5://127.0.0.1:9050) or http://HOST:PORT
                           (I2P, or an http:// IPFS gateway). onion uses Tor's
                           by default, i2p http://127.0.0.1:4444
-      --gateway URL       ipfs: the IPFS gateway to ask (default
-                          http://127.0.0.1:8080, Kubo's; a public one such as
-                          https://ipfs.io is asked one thing at a time)
+      --gateway URL       ipfs, arweave: the gateway to ask (defaults: ipfs
+                          http://127.0.0.1:8080, Kubo's; arweave
+                          https://turbo-gateway.com). One that isn't on this
+                          computer is asked one thing at a time
   -t, --timeout SECONDS   How long to wait for a server to connect or send more
                           (a whole page gets four times that). Defaults: gopher
-                          10, gemini 15, either through a proxy 30, onion 60,
-                          ipfs 60, i2p 120
+                          10, gemini 15, either through a proxy 30, arweave 30,
+                          onion 60, ipfs 60, i2p 120
   -h, --help              Show this help
   -V, --version           Show the version
 
@@ -144,8 +148,11 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
         "ipfs" => start(&args[1..], |o| {
             Ipfs::new(o.gateway.take(), o.proxy.take(), o.timeout)
         }),
+        "arweave" => start(&args[1..], |o| {
+            Arweave::new(o.gateway.take(), o.proxy.take(), o.timeout)
+        }),
         other => Err(format!(
-            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs)"
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave)"
         )
         .into()),
     }
@@ -226,8 +233,10 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
                 options.host_limit = Some(limit);
             }
             "--proxy" => options.proxy = Some(Proxy::parse(&value()?)?),
-            "--gateway" if P::NAME == "ipfs" => options.gateway = Some(value()?),
-            "--gateway" => return Err("--gateway is for lost-spider ipfs".into()),
+            "--gateway" if matches!(P::NAME, "ipfs" | "arweave") => {
+                options.gateway = Some(value()?)
+            }
+            "--gateway" => return Err("--gateway is for lost-spider ipfs and arweave".into()),
             "-t" | "--timeout" => {
                 let text = value()?;
                 let seconds: f64 = text
@@ -360,12 +369,17 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     };
     let status = |pages: u64| {
         let stats = crawler.stats();
+        let skipped = match stats.skipped.total() {
+            0 => String::new(),
+            n => format!(" · {} skipped", thousands(n)),
+        };
         format!(
-            "{} {} for {}… {} pages saved · {} {} · {} links waiting",
+            "{} {} for {}… {} pages saved{} · {} {} · {} links waiting",
             verb,
             P::SPACE,
             duration(started.elapsed()),
             thousands(pages),
+            skipped,
             thousands(stats.hosts as u64),
             P::HOSTS,
             thousands(stats.waiting),
@@ -443,8 +457,31 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
             path.display()
         );
     }
+    if let Some(line) = skipped_line(crawler.stats().skipped) {
+        eprintln!("{line}");
+    }
     eprintln!("To search them: lost -d \"{}\"", path.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Why pages weren't saved, when some weren't: "Not saved: 40 copies of
+/// pages saved already, 3 not found."
+fn skipped_line(skipped: crawl::Skipped) -> Option<String> {
+    let parts: Vec<String> = [
+        (
+            skipped.copies,
+            "copy of a page saved already",
+            "copies of pages saved already",
+        ),
+        (skipped.gone, "not found", "not found"),
+        (skipped.unreachable, "unreachable", "unreachable"),
+        (skipped.blocked, "blacklisted", "blacklisted"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| format!("{} {}", thousands(n), if n == 1 { one } else { many }))
+    .collect();
+    (!parts.is_empty()).then(|| format!("Not saved: {}.", parts.join(", ")))
 }
 
 /// "6 hours, 15 minutes, 56 seconds": the units from the largest one there

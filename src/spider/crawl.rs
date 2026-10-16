@@ -99,6 +99,12 @@ pub trait Protocol: Send + Sync + 'static {
     /// Where a host's robots.txt is.
     const ROBOTS: &'static str = "/robots.txt";
 
+    /// Whether a host (its `/` URL) can have a robots.txt at all; one that
+    /// can't is crawled without asking (Arweave's single files, say).
+    fn has_robots(_origin: &Url) -> bool {
+        true
+    }
+
     /// What robots.txt rules are matched against: the path and query.
     fn robots_path(url: &Url) -> String {
         match &url.query {
@@ -601,17 +607,18 @@ pub fn looks_like_posting(text: &str) -> bool {
 /// name are two, each with its own robots.txt); punycode for an
 /// internationalized host, so both spellings are one host.
 pub fn host_key(url: &Url) -> String {
-    let host = lost::urls::ascii_host(&url.host).unwrap_or_else(|| url.host.clone());
+    let host = lost::urls::wire_host(url).unwrap_or_else(|| url.host.clone());
     match url.port {
         Some(port) => format!("{}://{host}:{port}", url.scheme),
         None => format!("{}://{host}", url.scheme),
     }
 }
 
-/// The URL as it's sent: its host in punycode.
+/// The URL as it's sent: its host in punycode (but an Arweave ID or an IPFS
+/// CID as it is: lowercased, it's another one, or none).
 fn on_the_wire(url: &Url) -> Url {
     let mut url = url.clone();
-    if let Some(ascii) = lost::urls::ascii_host(&url.host) {
+    if let Some(ascii) = lost::urls::wire_host(&url) {
         url.host = ascii;
     }
     url
@@ -720,6 +727,7 @@ struct State {
     accepts: fn(&Url) -> bool,
     proxied: bool,
     robots_url: &'static str,
+    has_robots: fn(&Url) -> bool,
     robots_path: fn(&Url) -> String,
     is_file: fn(&Url) -> bool,
     untitled: fn(&Url) -> String,
@@ -738,6 +746,7 @@ struct State {
     active: usize,
     /// Of which, host names being looked up.
     resolving: usize,
+    skipped: Skipped,
 }
 
 enum Task {
@@ -773,6 +782,8 @@ enum Outcome {
     SlowDown(Duration),
     Retry,
     Nothing,
+    /// Not there (any more).
+    Gone,
     Failed,
 }
 
@@ -807,7 +818,7 @@ impl State {
         hops: u8,
         settings: &Settings,
     ) -> bool {
-        if !(self.accepts)(&url) || lost::urls::ascii_host(&url.host).is_none() {
+        if !(self.accepts)(&url) || lost::urls::wire_host(&url).is_none() {
             return false;
         }
         let url = clean(url);
@@ -842,23 +853,27 @@ impl State {
                 } else {
                     (None, String::new())
                 };
+                let wants_robots = (self.has_robots)(&origin);
                 if !done {
-                    queue.push_back(Job {
-                        url: robots,
-                        label: None,
-                        kind: Kind::Robots,
-                        tries: 0,
-                        hops: 0,
-                    });
+                    if wants_robots {
+                        queue.push_back(Job {
+                            url: robots,
+                            label: None,
+                            kind: Kind::Robots,
+                            tries: 0,
+                            hops: 0,
+                        });
+                        self.waiting += 1;
+                    }
                     if route.is_none() {
                         self.unresolved.push_back(key.clone());
                     }
-                    self.waiting += 1;
                 }
                 e.insert(Host {
                     origin,
                     queue,
-                    robots: None,
+                    // None to ask for: no rules.
+                    robots: (!wants_robots).then(Robots::default),
                     route,
                     server,
                     listed: false,
@@ -1072,12 +1087,15 @@ impl State {
                     .map_or(MAX_FAILURES, |host| host.failures);
                 if failures >= MAX_FAILURES {
                     self.retire(key);
+                    self.skipped.unreachable += 1;
                 } else if job.kind == Kind::Robots {
                     // Asked again before anything else: nothing is fetched
                     // there without its rules.
                     self.requeue(key, job, true);
                 } else if job.tries == 0 {
                     self.requeue(key, Job { tries: 1, ..job }, false);
+                } else {
+                    self.skipped.unreachable += 1;
                 }
             }
             Outcome::Robots(robots) => {
@@ -1092,6 +1110,11 @@ impl State {
                 links,
             } => {
                 let new = !blocked && content.is_none_or(|c| self.contents.insert(c));
+                if blocked {
+                    self.skipped.blocked += 1;
+                } else if !new {
+                    self.skipped.copies += 1;
+                }
                 if new {
                     if let Some(host) = self.hosts.get_mut(key) {
                         host.saved += 1;
@@ -1169,6 +1192,7 @@ impl State {
                     self.retire(key);
                 }
             }
+            Outcome::Gone => self.skipped.gone += 1,
             Outcome::Nothing => {}
         }
 
@@ -1185,6 +1209,26 @@ impl State {
 pub struct Stats {
     pub hosts: usize,
     pub waiting: u64,
+    pub skipped: Skipped,
+}
+
+/// Pages fetched (or tried) but not saved, by why.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Skipped {
+    /// The same text as a page saved already.
+    pub copies: u64,
+    /// Not found, or not there any more.
+    pub gone: u64,
+    /// No answer, or errors only, after trying again.
+    pub unreachable: u64,
+    /// Kept out by the blacklist.
+    pub blocked: u64,
+}
+
+impl Skipped {
+    pub fn total(&self) -> u64 {
+        self.copies + self.gone + self.unreachable + self.blocked
+    }
 }
 
 pub struct Crawler<P: Protocol> {
@@ -1204,6 +1248,7 @@ impl<P: Protocol> Crawler<P> {
             accepts: P::accepts,
             proxied: protocol.proxied(),
             robots_url: P::ROBOTS,
+            has_robots: P::has_robots,
             robots_path: P::robots_path,
             is_file: P::is_file,
             untitled: P::fallback_title,
@@ -1218,6 +1263,7 @@ impl<P: Protocol> Crawler<P> {
             waiting: 0,
             active: 0,
             resolving: 0,
+            skipped: Skipped::default(),
         };
         // With --dont-crawl, the links are all there is to fetch: no seeds,
         // and nothing from the file's pages.
@@ -1274,6 +1320,7 @@ impl<P: Protocol> Crawler<P> {
         Stats {
             hosts: state.hosts.len(),
             waiting: state.waiting,
+            skipped: state.skipped,
         }
     }
 
@@ -1442,7 +1489,7 @@ impl<P: Protocol> Crawler<P> {
             }
             Response::SlowDown(wait) => Outcome::SlowDown(wait),
             Response::TryLater => Outcome::Retry,
-            Response::Gone => Outcome::Nothing,
+            Response::Gone => Outcome::Gone,
         }
     }
 }
@@ -1638,6 +1685,10 @@ mod tests {
             }
         }
 
+        fn has_robots(origin: &Url) -> bool {
+            !origin.host.starts_with("norobots")
+        }
+
         fn resolve(&self, url: &Url) -> Option<SocketAddr> {
             assert!(!self.proxied, "nothing is looked up through a proxy");
             // Every *.test host lives on one server, except nowhere.test.
@@ -1701,6 +1752,63 @@ mod tests {
             dont_crawl: false,
             workers: 4,
         }
+    }
+
+    #[test]
+    fn ids_are_sent_as_they_are() {
+        // An Arweave ID lowercased is another ID (one that isn't there).
+        let tx = "bNbA3TEQVL60xlgCcqdz4ZPHFZ711cZ3hmkpGttDt_U";
+        let url = Url::parse(&format!("ar://{tx}/")).unwrap();
+        assert_eq!(on_the_wire(&url).host, tx);
+        assert_eq!(host_key(&url), format!("ar://{tx}"));
+        let other = Url::parse(&format!("ar://{}/", tx.to_lowercase())).unwrap();
+        assert_ne!(seen_key(&url), seen_key(&other));
+        // Other hosts still go out lowercase, in punycode.
+        let mut url = Url::parse("gemini://café.example/").unwrap();
+        url.host = "Café.Example".into();
+        assert_eq!(on_the_wire(&url).host, "xn--caf-dma.example");
+    }
+
+    #[test]
+    fn what_wasnt_saved_and_why() {
+        let fake = Fake {
+            pages: [
+                (
+                    "gemini://a.test/",
+                    doc("Home =>/copy =>/missing =>gemini://down.test/"),
+                ),
+                (
+                    "gemini://a.test/copy",
+                    doc("Home =>/copy =>/missing =>gemini://down.test/"),
+                ),
+                ("gemini://a.test/robots.txt", doc("")),
+            ]
+            .into_iter()
+            .map(|(u, r)| (u.to_string(), r))
+            .collect(),
+            asked: Mutex::new(Vec::new()),
+            proxied: false,
+        };
+        let crawler = Crawler::new(
+            fake,
+            settings(),
+            Known::default(),
+            &["gemini://a.test/".into()],
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(100);
+        crawler.start(tx);
+        assert_eq!(rx.iter().count(), 1);
+        let skipped = crawler.stats().skipped;
+        assert_eq!(
+            skipped,
+            Skipped {
+                copies: 1,
+                gone: 1,
+                unreachable: 1,
+                blocked: 0,
+            }
+        );
+        assert_eq!(skipped.total(), 3);
     }
 
     #[test]
@@ -2021,5 +2129,33 @@ mod tests {
                 .count()
                 <= MAX_FAILURES as usize
         );
+    }
+
+    #[test]
+    fn hosts_without_robots_txt() {
+        // Not asked for a robots.txt it can't have; crawled all the same,
+        // looked up or through a proxy.
+        for proxied in [false, true] {
+            let pages = vec![
+                ("gemini://norobots.test/", doc("Home =>/a")),
+                ("gemini://norobots.test/a", doc("A")),
+            ];
+            let (saved, asked) = crawl_via(
+                proxied,
+                pages,
+                settings(),
+                Known::default(),
+                &["gemini://norobots.test/"],
+            );
+            let urls: Vec<&str> = saved.iter().map(|p| p.url.as_str()).collect();
+            assert_eq!(
+                urls,
+                ["gemini://norobots.test/", "gemini://norobots.test/a"]
+            );
+            assert!(
+                !asked.iter().any(|u| u.ends_with("robots.txt")),
+                "{asked:?}"
+            );
+        }
     }
 }

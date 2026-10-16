@@ -310,7 +310,7 @@ The loser is discarded, never archived. On a tie the existing version stays, so 
 
 Merging only works if every source spells a URL the same way. The **key** is computed from a normalized URL; the **original** URL is kept for display.
 
-- Lowercase scheme and host — except the "hosts" of `ipfs://` and `ipns://`, which are content IDs and keys, where base58 (`Qm…`, `12D3Koo…`) is case-sensitive; remove default ports (`:80`, `:443`).
+- Lowercase scheme and host — except the "hosts" of `ipfs://`, `ipns://` and `ar://`, which are content IDs, keys and Arweave transaction IDs, where base58 (`Qm…`, `12D3Koo…`) and base64 are case-sensitive; remove default ports (`:80`, `:443`).
 - `http`/`https` and `www.`/no `www.` are treated as the same page.
 - Remove tracking parameters (`utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `ref`, …); keep all other query parameters as they are.
 - Remove a trailing slash from the path (except for the root `/`).
@@ -795,7 +795,8 @@ lost/
         ├── gopher.rs         Gopher: selectors, menus
         ├── onion.rs          .onion sites through Tor; Ahmia's banned list
         ├── i2p.rs            I2P sites through a router; address books
-        └── ipfs.rs           IPFS through a gateway; CIDs, one way to write them
+        ├── ipfs.rs           IPFS through a gateway; CIDs, one way to write them
+        └── arweave.rs        Arweave through a gateway; GraphQL listings, ArNS
 ```
 
 ### 13.1 Library API (sketch)
@@ -853,7 +854,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
                     [--host-limit N] [--proxy URL] [--gateway URL] [-t SECONDS]
 ```
 
-`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), or `ipfs` (§15.7); the options are the same for each, but for `--gateway`, which is `ipfs`'s.
+`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7) or `arweave` (§15.8); the options are the same for each, but for `--gateway`, which is `ipfs`'s and `arweave`'s.
 
 | Option | What it does |
 |---|---|
@@ -867,12 +868,12 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | `--delay SECONDS` | Between two requests to the same server; default 1, decimals allowed |
 | `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
 | `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
-| `--gateway URL` | `ipfs` only: the IPFS gateway to ask, `http://HOST:PORT` or `https://HOST` (default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
-| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, IPFS 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
+| `--gateway URL` | `ipfs` and `arweave`: the gateway to ask, `http://HOST:PORT` or `https://HOST` (`arweave`: default `https://turbo-gateway.com`, §15.8; `ipfs`: default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
+| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Arweave 30 s, IPFS 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Unsigned ("Saving to NAME, unsigned."), or with `--sign` signed with your ID ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."). If `--sign` is given and the ID can't be read or made, the spider stops before crawling rather than leave the file unsigned.
-- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Crawling Geminispace for 2 hours, 5 minutes, 9 seconds… 1,234 pages saved · 56 capsules · 7,890 links waiting` (the time is this run's) — `Scraping Geminispace…` with `--dont-crawl`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise.
+- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Crawling Geminispace for 2 hours, 5 minutes, 9 seconds… 1,234 pages saved · 56 capsules · 7,890 links waiting` (the time is this run's) — `Scraping Geminispace…` with `--dont-crawl`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise. Once something fetched isn't saved, the line says how much (`· 40 skipped`, after `pages saved`), and the summary at the end says why, leaving out the reasons that didn't come up: `Not saved: 30 copies of pages saved already, 8 not found, 2 unreachable, 1 blacklisted.` (a copy is a page whose text is the same as one saved already; unreachable means no answer, or only errors, after trying again).
 - Ctrl-C (or SIGTERM, SIGHUP) stops: requests under way are abandoned, pages already received are written, and the file is finished (and signed, with `--sign`). A second Ctrl-C quits at once, leaving the file as of its last checkpoint. The last lines say how to continue and how to import.
 
 ### 15.2 Crawling (`crawl.rs`)
@@ -956,6 +957,18 @@ Sites and files addressed by their content (`ipfs://CID/…`), and names that po
 - Before crawling, the gateway must answer a connection, or the spider stops ("is your IPFS node running? (ipfs daemon)"). Then, since a node finds nothing until it's connected to other nodes (its gateway answers every request with a 504 after its own timeout, 30 s in Kubo), the first seed is asked for until something other than a 5xx comes back: every 10 seconds for up to 10 minutes, saying "Waiting for the IPFS node to find content (the gateway answered 504: …)…" with the gateway's reason, and giving up with it.
 - Seeds: the IPFS project's sites (`docs.ipfs.tech`, `blog.ipfs.tech`, `specs.ipfs.tech`, `ipfs.tech`, all DNSLink) and an ENS site (`vitalik.eth`). More with `--links`.
 - Default timeout 60 s: content not cached by the node is looked up on the network first.
+
+### 15.8 Arweave (`arweave.rs`)
+
+Data stored for good, each piece (a transaction, or a data item in a bundle) under its ID — 43 characters of base64url — fetched over HTTP from a gateway (`--gateway`; `https://turbo-gateway.com` by default, ar.io's; an ar.io node of your own works too).
+
+- **Addresses:** `ar://ID/path`, or `ar://NAME/path` for ArNS names (`ardrive`; undernames as `docs_ardrive`), lowercase. IDs keep their case (§6.5). Links to known gateways (arweave.net, ar.io, turbo-gateway.com, permagate.io, g8way.io, …) become `ar://` links: `/ID/…` or `/raw/ID` on the gateway or any subdomain of it (sandbox subdomains, which gateways use to give data its own origin), and `NAME.gateway/…`. Queries and fragments go.
+- **Requests:** `ar://ID/` is `GET /ID`, `ar://ID/path` `GET /ID/path` (a path inside a manifest, a site's map of its files). A name is looked up first (`GET /ar-io/resolver/NAME`, its `txId`; once a crawl), and a name the gateway doesn't know is "not found". A redirect within the gateway (to its sandbox subdomain, or adding a `/`) is followed at once, up to 3; elsewhere, it's a link. 5xx counts as unreachable. Answers are read as in §15.6, and links are those of §15.6's HTML plus `ar://` URLs written in the text.
+- **The listing.** A gateway's GraphQL endpoint (`POST /graphql`) knows every item stored, so the crawl also walks through those tagged `Content-Type` `text/html`, `text/plain`, `text/markdown` or `application/x.arweave-manifest+json` (sites), newest first (`sort: HEIGHT_DESC`), 100 at a time — **a range of blocks at a time** (`block: {min, max}`), since a gateway won't go through all of Arweave for one answer (turbo-gateway.com stops at 30 million rows read: "Limit for rows or bytes to read exceeded"). It starts at the newest block (`GET /info`'s `height`) with 20 blocks; a range the gateway answers with an error is asked for again in halves (a single block that still fails is skipped), and after a range with fewer than 50 items the next one is twice as big, up to 5,000 blocks. Each answer is a page that's followed, not saved, whose links are the items (`ar://ID/`, a `Title` or `Page-Title` tag as their text) — except programs' messages to each other, which are most of what's newest and are tagged `text/plain` too: AO's (any `Data-Protocol` tag) and SmartWeave's (an `App-Name` starting with `SmartWeave`); GraphQL can only ask for tags that are there, so these are dropped from each answer and where the listing goes on: the same blocks' next page, `ar://graphql.ar/?max=BLOCK&size=BLOCKS&after=CURSOR`, or the blocks before them (no name or ID has a dot, so that host is no item's). `ar://graphql.ar/` is the first seed, with `ar://ardrive/`. Nothing about it is stored: with `-c` it starts again from the newest, skipping what the file has. Before crawling, the gateway's newest block is asked for — one that can't be reached stops the spider — and then the newest blocks' listing: "Listing Arweave from block N, newest first.", or, if GraphQL says no, a line with its reason, and only links are followed.
+- **Answers that are data** (the name resolver's and `/info`'s JSON) are read whatever their type (`Http::get_data`); pages, as in §15.6.
+- **robots.txt** only for names (sites): an ID is one piece of data, mostly a single file, so it's crawled without asking (`Protocol::has_robots`), and so is the listing.
+- **Servers:** a gateway on this computer is asked about many items at once; any other is one server, asked one thing at a time (`--delay`).
+- Default timeout 30 s.
 
 ---
 

@@ -76,7 +76,7 @@ LOST searches through whatever datasets you import.  It comes out of the box wit
 - Common Crawl (WET and WAT files)
 - Hacker News (BigQuery CSV export)
 - `.lost` files — LOST's own format
-- Gemini, Gopher, `.onion`, I2P and IPFS — crawled with `lost-spider` (see [below](#crawling-gemini-gopher-onion-i2p-and-ipfs))
+- Gemini, Gopher, `.onion`, I2P, IPFS and Arweave — crawled with `lost-spider` (see [below](#crawling-gemini-gopher-onion-i2p-ipfs-and-arweave))
 
 
 ### Datasets
@@ -104,9 +104,9 @@ SELECT * FROM `bigquery-public-data.hacker_news.full` WHERE timestamp >= '2026-0
 
 LOST is capable of importing and exporting `.lost` dataset files, which makes it possible to freely and safely exchange crawl data with other LOST users.  They aren't signed unless you ask (`lost -e FILE --sign`, or the "Sign it" checkbox): a signature lets others tell which files are yours and keeps your database from getting corrupted or spammed, but it also says who made the file.  Both exports and imports can be made either via CLI (see [Usage](#working-with-datasets)) or GUI (Settings → Data).
 
-#### Crawling: Gemini, Gopher, .onion, I2P and IPFS
+#### Crawling: Gemini, Gopher, .onion, I2P, IPFS and Arweave
 
-LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/), Gopherspace, `.onion` sites, I2P sites and [IPFS](https://ipfs.tech/) there's `lost-spider`, a separate crawler that isn't built or installed by default:
+LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/), Gopherspace, `.onion` sites, I2P sites, [IPFS](https://ipfs.tech/) and [Arweave](https://arweave.org/) there's `lost-spider`, a separate crawler that isn't built or installed by default:
 
 ```console
 cargo install lost --features spider               # or: make spider
@@ -119,13 +119,14 @@ lost-spider onion                                  # .onion sites, through Tor (
 lost-spider i2p                                    # I2P sites, through an I2P router (127.0.0.1:4444)
 lost-spider ipfs                                   # IPFS sites, through an IPFS node's gateway (127.0.0.1:8080)
 lost-spider ipfs --link vitalik.eth                # an ENS name, or a CID, or an IPNS name
+lost-spider arweave                                # the permaweb, through a public gateway
 lost-spider gemini --proxy socks5://127.0.0.1:9050 # Gemini through Tor
 lost -d my.lost                                    # import what it found
 ```
 
 It obeys robots.txt, asks each server for one thing a second (`--delay`), and saves everything into one `.lost` file, unsigned unless you ask for `--sign`.  The file is complete even if you stop it with Ctrl-C.  See `lost-spider --help` for search boxes, blacklists, proxies and limits.
 
-`onion` needs [Tor](https://www.torproject.org/) running, `i2p` an I2P router ([i2pd](https://i2pd.website/) or [Java I2P](https://geti2p.net/)), and `ipfs` an IPFS node ([Kubo](https://github.com/ipfs/kubo), `ipfs daemon`), or `--gateway https://ipfs.io` to ask a public gateway instead (one request at a time).  I2P is slow: reaching a site for the first time can take a minute or more, so its timeout is 120 seconds by default (`-t` changes it, for any network), and on a router (or Tor) that has just started, `lost-spider` waits a few minutes until it can reach sites.  Images and other files are never downloaded, only their links.  Before crawling `.onion` sites, `lost-spider` gets [Ahmia](https://ahmia.fi/)'s list of onion sites banned for child abuse material and skips them; it won't start without that list.  Darknets host all sorts of things, so it's worth keeping a `--blacklist` with `title:/…/` and `body:/…/` rules for what you don't want in your dataset.
+`onion` needs [Tor](https://www.torproject.org/) running, `i2p` an I2P router ([i2pd](https://i2pd.website/) or [Java I2P](https://geti2p.net/)), and `ipfs` an IPFS node ([Kubo](https://github.com/ipfs/kubo), `ipfs daemon`), or `--gateway https://ipfs.io` to ask a public gateway instead (one request at a time).  `arweave` needs nothing: it asks a public gateway (one request at a time), and also goes through everything Arweave stores, newest first, besides following links.  I2P is slow: reaching a site for the first time can take a minute or more, so its timeout is 120 seconds by default (`-t` changes it, for any network), and on a router (or Tor) that has just started, `lost-spider` waits a few minutes until it can reach sites.  Images and other files are never downloaded, only their links.  Before crawling `.onion` sites, `lost-spider` gets [Ahmia](https://ahmia.fi/)'s list of onion sites banned for child abuse material and skips them; it won't start without that list.  Darknets host all sorts of things, so it's worth keeping a `--blacklist` with `title:/…/` and `body:/…/` rules for what you don't want in your dataset.
 
 
 ### Database
