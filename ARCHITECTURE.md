@@ -310,7 +310,8 @@ The loser is discarded, never archived. On a tie the existing version stays, so 
 
 Merging only works if every source spells a URL the same way. The **key** is computed from a normalized URL; the **original** URL is kept for display.
 
-- Lowercase scheme and host; remove default ports (`:80`, `:443`).
+- Lowercase scheme and host — except the "hosts" of `ipfs://`, `ipns://` and `ar://`, which are content IDs, keys and Arweave transaction IDs, where base58 (`Qm…`, `12D3Koo…`) and base64 are case-sensitive; remove default ports (`:80`, `:443`; `ws://` and `wss://` too).
+- Nostr URIs (NIP-21) have no `//`: `nostr:npub1…` is a URL whose host is what follows `nostr:` (bech32, lowercase; `nostr://npub1…` is read the same way), and is written back as `nostr:npub1…`.
 - `http`/`https` and `www.`/no `www.` are treated as the same page.
 - Remove tracking parameters (`utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `ref`, …); keep all other query parameters as they are.
 - Remove a trailing slash from the path (except for the root `/`).
@@ -793,8 +794,17 @@ lost/
         ├── http.rs           HTTP/1.1 and HTML, for the web networks
         ├── gemini.rs         Gemini: TLS, responses, gemtext
         ├── gopher.rs         Gopher: selectors, menus
+        ├── spartan.rs        Spartan: Gemini without TLS
+        ├── nex.rs            Nex: paths, directories
+        ├── finger.rs         Finger: people's .plans
         ├── onion.rs          .onion sites through Tor; Ahmia's banned list
-        └── i2p.rs            I2P sites through a router; address books
+        ├── i2p.rs            I2P sites through a router; address books
+        ├── ipfs.rs           IPFS through a gateway; CIDs, one way to write them
+        ├── arweave.rs        Arweave through a gateway; GraphQL listings, ArNS
+        ├── nostr.rs          Nostr relays: listings, posts, profiles, NIP-19
+        ├── ton.rs            TON Sites through a TON proxy
+        ├── swarm.rs          Swarm through a gateway; ENS names, bzz.link, CIDs
+        └── websocket.rs      WebSocket (RFC 6455), for Nostr relays
 ```
 
 ### 13.1 Library API (sketch)
@@ -849,10 +859,10 @@ A crawler for the networks LOST can't get dumps of. It saves what it finds as a 
 ```
 lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
                     [--search PHRASE]… [--searches FILE] [--blacklist FILE] [--delay SECONDS]
-                    [--host-limit N] [--proxy URL] [-t SECONDS]
+                    [--host-limit N] [--proxy URL] [--gateway URL] [-t SECONDS]
 ```
 
-`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` (§15.6) or `i2p` (§15.7); the options are the same for each.
+`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7), `arweave` (§15.8), `nostr` (§15.9), `ton` (§15.10), `swarm` (§15.11), or `spartan`, `nex` or `finger` (§15.12); the options are the same for each, but for `--gateway`, which is `ipfs`'s, `arweave`'s and `swarm`'s.
 
 | Option | What it does |
 |---|---|
@@ -861,16 +871,17 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | `--sign` | Sign the file with your ID (§9.2), made if there's none yet; with `-c`, your signature replaces the file's, whoever's it was. Without it the file is unsigned (no ID is read or made), and with `-c` a signature it had is removed: the header loses its `signer`, the signed flag is cleared and no signature follows the footer (§9.4). Unsigned is the default because a signature says who made the file, and anonymity is one of LOST's points |
 | `--link URL`, `--links FILE` | Crawled first, even if nothing links to them (`example.org` means `gemini://example.org/`, or `gopher://…` for Gopher). A file has one a line; blank lines and `#` comments are skipped |
 | `--dont-crawl` | Fetch only the `--link` URLs (following their redirects) and none of the links on them: an easy way to add certain pages to a file, and nothing else. No seeds, and with `-c` nothing from the file's pages; a search box among them gets the `--search` phrases, and the results pages are saved. Needs `--link` or `--links` |
-| `--search PHRASE`, `--searches FILE` | Typed into the search boxes found (§15.2) |
-| `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`). Skipped pages aren't saved and their links aren't followed |
-| `--delay SECONDS` | Between two requests to the same server; default 1, decimals allowed |
+| `--search PHRASE`, `--searches FILE` | Typed into the search boxes found (§15.2); for `nostr`, searched for on the relays that can (§15.9) |
+| `--blacklist FILE` | URLs and pages to skip, this run: the draft blocklist format of §9.2 (domains, URL beginnings, hosts-file lines, `/regex/` on the URL, `title:/regex/`, `body:/regex/`; `nostr:…` URIs are URL beginnings too, and for `nostr` an `npub1…`, `nostr:npub1…` or `nprofile1…` is an author whose posts are all skipped, §15.9). Skipped pages aren't saved and their links aren't followed |
+| `--delay SECONDS` | Between two requests to the same server (for `nostr`, the same relay); default 1, decimals allowed |
 | `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
-| `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
-| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
+| `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`, `ton` `http://127.0.0.1:8080`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
+| `--gateway URL` | `ipfs`, `arweave` and `swarm`: the gateway to ask, `http://HOST:PORT` or `https://HOST` (`arweave`: default `https://turbo-gateway.com`, §15.8; `swarm`: default `https://api.gateway.ethswarm.org`, or a Bee node's `http://127.0.0.1:1633`, §15.11; `ipfs`: default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
+| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher and Finger 10 s, Gemini, Spartan and Nex 15 s, any of those through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Nostr 20 s, Arweave 30 s, IPFS 60 s, TON 60 s, Swarm 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Unsigned ("Saving to NAME, unsigned."), or with `--sign` signed with your ID ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."). If `--sign` is given and the ID can't be read or made, the spider stops before crawling rather than leave the file unsigned.
-- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Crawling Geminispace for 2 hours, 5 minutes, 9 seconds… 1,234 pages saved · 56 capsules · 7,890 links waiting` (the time is this run's) — `Scraping Geminispace…` with `--dont-crawl`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise.
+- Progress goes to stderr (the pages counted are all the file's, with `-c` too): `Crawling Geminispace for 2 hours, 5 minutes, 9 seconds… 1,234 pages saved · 56 capsules · 7,890 links waiting` (the time is this run's) — `Scraping Geminispace…` with `--dont-crawl`, since it only fetches what it's given — redrawn every second on a terminal, a line a minute otherwise. Once something fetched isn't saved, the line says how much (`· 40 skipped`, after `pages saved`), and the summary at the end says why, leaving out the reasons that didn't come up: `Not saved: 30 copies of pages saved already, 8 not found, 2 unreachable, 1 blacklisted.` (a copy is a page whose text is the same as one saved already; unreachable means no answer, or only errors, after trying again).
 - Ctrl-C (or SIGTERM, SIGHUP) stops: requests under way are abandoned, pages already received are written, and the file is finished (and signed, with `--sign`). A second Ctrl-C quits at once, leaving the file as of its last checkpoint. The last lines say how to continue and how to import.
 
 ### 15.2 Crawling (`crawl.rs`)
@@ -937,6 +948,81 @@ Both are ordinary websites reached through a proxy, so they share an HTTP client
 - Default timeout 120 s: a site reached for the first time can take a minute or more while the router builds tunnels.
 
 Darknets in particular host material no one wants in a dataset: `--blacklist`'s `title:/…/` and `body:/…/` rules keep pages out by what they say, and their links aren't followed.
+
+### 15.7 IPFS (`ipfs.rs`)
+
+Sites and files addressed by their content (`ipfs://CID/…`), and names that point to the latest version of something (`ipns://NAME/…`), fetched over HTTP from an IPFS node's gateway (`--gateway`, §15.1), which finds the content on the network and looks names up. With Kubo, that includes ENS names (`vitalik.eth`), resolved through eth.limo's DNS-over-HTTPS by default in current versions (`ipfs config --json DNS.Resolvers '{"eth.": "https://dns.eth.limo/dns-query"}'` in older ones).
+
+- **Requests:** `ipfs://CID/path?query` is `GET /ipfs/CID/path?query` on the gateway, `ipns://NAME/…` `GET /ipns/NAME/…`, through the HTTP client of §15.6. Its answers are read as there, but for a 5xx (not found on the network in time, or a name the node can't look up), which counts as the site being unreachable (§15.2's failures) — unless it says the path isn't in the content ("no link named …", a robots.txt asked of a file, say), which is "not found" — and redirects, which come back as `ipfs://` and `ipns://` URLs (the gateway's `/ipfs/CID/dir/` for a folder without its `/`). A folder without an `index.html` is the gateway's listing of it: a page of file names, whose links are followed.
+- **One way to write an address.** Pages are saved, and links kept, as:
+  - `ipfs://` + the CID as CIDv1 in base32 (`bafy…`), whatever it was written as: CIDv0 (`Qm…`, base58), or CIDv1 in base32, base36, base58 or hex. Its bytes are checked: a CID's version, codec and multihash.
+  - `ipns://` + a key as CIDv1 in base36 (`k51…`), from an Ed25519 peer ID (`12D3Koo…`) or a key's CIDv1 in any base; or a domain, lowercase (DNSLink, `docs.ipfs.tech`; ENS, `vitalik.eth`). A CID given as an IPNS name is content (`ipfs://`); so is `Qm…`, which old RSA peer IDs looked like, but almost always is content.
+  - From gateways: a path (`https://ipfs.io/ipfs/CID/…`, any host, when what follows `/ipfs/` is a CID, or `/ipns/` a key or a domain), or a subdomain (`https://CID.ipfs.dweb.link/…`; `https://docs-ipfs-tech.ipns.dweb.link/…`, a DNSLink name made one label: `-` for `.`, `--` for `-`). `/ipfs/CID/…` on an IPFS page, as folder listings link, is that CID's.
+  - Queries (gateways' `?filename=`, `?format=`…) and fragments go.
+  - `--link` takes any of them: `--link docs.ipfs.tech` is `ipns://docs.ipfs.tech/`, `--link Qm…` is its `ipfs://bafy…/`.
+- **Links:** those of §15.6's HTML, plus `ipfs://` and `ipns://` URLs written in the text. Only `ipfs://` and `ipns://` are crawled; the others (the web) are kept in `links`.
+- **Servers:** every `ipfs://` CID and `ipns://` name is a host, with its own robots.txt (`/robots.txt` under it) and `--host-limit`. Through a gateway on this computer, each is a server of its own, so many are asked at once; through any other, they're all one server.
+- Before crawling, the gateway must answer a connection, or the spider stops ("is your IPFS node running? (ipfs daemon)"). Then, since a node finds nothing until it's connected to other nodes (its gateway answers every request with a 504 after its own timeout, 30 s in Kubo), the first seed is asked for until something other than a 5xx comes back: every 10 seconds for up to 10 minutes, saying "Waiting for the IPFS node to find content (the gateway answered 504: …)…" with the gateway's reason, and giving up with it.
+- Seeds: the IPFS project's sites (`docs.ipfs.tech`, `blog.ipfs.tech`, `specs.ipfs.tech`, `ipfs.tech`, all DNSLink) and an ENS site (`vitalik.eth`). More with `--links`.
+- Default timeout 60 s: content not cached by the node is looked up on the network first.
+
+### 15.8 Arweave (`arweave.rs`)
+
+Data stored for good, each piece (a transaction, or a data item in a bundle) under its ID — 43 characters of base64url — fetched over HTTP from a gateway (`--gateway`; `https://turbo-gateway.com` by default, ar.io's; an ar.io node of your own works too).
+
+- **Addresses:** `ar://ID/path`, or `ar://NAME/path` for ArNS names (`ardrive`; undernames as `docs_ardrive`), lowercase. IDs keep their case (§6.5). Links to known gateways (arweave.net, ar.io, turbo-gateway.com, permagate.io, g8way.io, …) become `ar://` links: `/ID/…` or `/raw/ID` on the gateway or any subdomain of it (sandbox subdomains, which gateways use to give data its own origin), and `NAME.gateway/…`. Queries and fragments go.
+- **Requests:** `ar://ID/` is `GET /ID`, `ar://ID/path` `GET /ID/path` (a path inside a manifest, a site's map of its files). A name is looked up first (`GET /ar-io/resolver/NAME`, its `txId`; once a crawl), and a name the gateway doesn't know is "not found". A redirect within the gateway (to its sandbox subdomain, or adding a `/`) is followed at once, up to 3; elsewhere, it's a link. 5xx counts as unreachable. Answers are read as in §15.6, and links are those of §15.6's HTML plus `ar://` URLs written in the text.
+- **The listing.** A gateway's GraphQL endpoint (`POST /graphql`) knows every item stored, so the crawl also walks through those tagged `Content-Type` `text/html`, `text/plain`, `text/markdown` or `application/x.arweave-manifest+json` (sites), newest first (`sort: HEIGHT_DESC`), 100 at a time — **a range of blocks at a time** (`block: {min, max}`), since a gateway won't go through all of Arweave for one answer (turbo-gateway.com stops at 30 million rows read: "Limit for rows or bytes to read exceeded"). It starts at the newest block (`GET /info`'s `height`) with 20 blocks; a range the gateway answers with an error is asked for again in halves (a single block that still fails is skipped), and after a range with fewer than 50 items the next one is twice as big, up to 5,000 blocks. Each answer is a page that's followed, not saved, whose links are the items (`ar://ID/`, a `Title` or `Page-Title` tag as their text) and where the listing goes on: the same blocks' next page, `ar://graphql.ar/?max=BLOCK&size=BLOCKS&after=CURSOR`, or the blocks before them (no name or ID has a dot, so that host is no item's). Programs' messages to each other, which are most of what's newest and are tagged `text/plain` too, aren't items: AO's (any `Data-Protocol` tag) and SmartWeave's (an `App-Name` starting with `SmartWeave`) are dropped from each answer, since GraphQL can only ask for tags that are there. `ar://graphql.ar/` is the first seed, with `ar://ardrive/`. Nothing about it is stored: with `-c` it starts again from the newest, skipping what the file has. Before crawling, the gateway's newest block is asked for — one that can't be reached stops the spider — and then the newest blocks' listing: "Listing Arweave from block N, newest first.", or, if GraphQL says no, a line with its reason, and only links are followed.
+- **Answers that are data** (the name resolver's and `/info`'s JSON) are read whatever their type (`Http::get_data`); pages, as in §15.6.
+- **robots.txt** only for names (sites): an ID is one piece of data, mostly a single file, so it's crawled without asking (`Protocol::has_robots`), and so is the listing.
+- **Servers:** a gateway on this computer is asked about many items at once; any other is one server, asked one thing at a time (`--delay`).
+- Default timeout 30 s.
+
+### 15.9 Nostr (`nostr.rs`, `websocket.rs`)
+
+Nostr has no sites: posts ("events", NIP-01) are signed by their authors and kept by relays, servers anyone runs, reached over WebSocket (`wss://`). The same post is usually on many relays and none of them is its home, so a post is named by itself.
+
+- **Addresses** (NIP-19, NIP-21): `nostr:note1…` (a post, by its ID), `nostr:naddr1…` (an article or wiki entry: author, kind and name, so its newest version) and `nostr:npub1…` (a profile, by its key). These are what pages are saved under: `nevent1…` and `nprofile1…` (which add relays to look on) become `note1…` and `npub1…`, and an `naddr1…` loses its relays, so a post has one URL whoever linked to it and how. `nsec1…` (a secret key) is never taken as an address. Relays are `wss://HOST/PATH` (or `ws://`).
+- **What's saved:** notes (kind 1) and comments (1111), titled "AUTHOR: its first 60 characters…", the text as it is, with mentions of people whose names are known written `@name`; notes with fewer than 10 letters and digits once links and mentions are left out ("gm", "🤙", a lone link) are followed, not saved. Long-form articles (30023, NIP-23): their `title`, their `summary` then the Markdown as text (images by their descriptions; links by their text, and kept as links). Wiki entries (30818, NIP-54): `title` or the entry's name, the AsciiDoc as text. Profiles (0): the name (`display_name`, else `name`), and the `about`, `name`, NIP-05 address and website as text. Reposts (6) lead to what they repost. Other kinds aren't pages.
+- **Searching** (`--search`, NIP-50): with phrases to search for, four relays known to search are seeds too (search.nos.today, relay.nostr.band, relay.ditto.pub, relay.noswhere.com), and every relay's page asks it what it can do first (its NIP-11 document: `GET https://RELAY/`, `Accept: application/nostr+json`, once a relay): one that lists NIP 50 among its `supported_nips` gets a listing per phrase, `?kinds=0,1,30023,30818&search=PHRASE` (profiles too, then), 100 results at a time and paged like the others (`&until=TIME`); a relay that doesn't say it searches isn't asked (it might ignore `search` and send everything). A relay whose document says it needs logging in or paying (`limitation.auth_required`, `payment_required`) isn't listed at all.
+- **Authors can be blacklisted:** an `npub1…`, `nostr:npub1…` or `nprofile1…` line in `--blacklist` skips that author's posts everywhere (listings, profiles, links to them): "Skipping the posts of N blacklisted authors." A `nostr:note1…` line skips that post, like any URL beginning.
+- **Deletions** (NIP-09): a deletion request (kind 5) names posts by ID (`e`) or address (`a`); a post whose own author asked for it to be deleted isn't saved (anyone else's request doesn't count). Requests are read where they'd be: in the notes' listings (`?kinds=1,5`, so, since they're newer than what they delete, before the notes come up), with a profile (the author's last 200), and with any post looked up (`#e`/`#a` filters on the same request). A post kept from a listing is checked again when its turn comes.
+- **Topics:** an article's or wiki entry's `t` tags are added to its text as `#hashtags`, those it doesn't have already.
+- **Checked:** each post's ID must be the SHA-256 of what NIP-01 says to write out, and its signature (BIP-340 Schnorr, secp256k1; the `k256` crate) must be its author's, so no relay can make up a post in someone's name. One that fails isn't saved or followed. **Posts that ask to expire** (NIP-40, an `expiration` tag) aren't kept at all, whatever the date: they were meant to go away, and a `.lost` file is for good.
+- **Links:** a post's author (their profile), what its tags point at (`p`: people; `e`, `q`: posts; `a`: articles), the `nostr:` references in its text (NIP-27) and its `http(s)://` links (an article's, from what's shown, not its images'). A profile's links are its website, its author's relays (their NIP-65 list, kind 10002: how the crawl gets from the seeds to the rest of the network) and their newest 50 notes and 50 articles or wiki entries.
+- **The listings.** Each relay is listed, newest first, 200 posts at a time: `wss://RELAY/` is a page that's followed, not saved, whose links are its two listings, `?kinds=30023,30818` (articles and wiki entries, which would be lost among notes) and `?kinds=1,5` (notes, and deletion requests); each listing page's links are its posts and the page before it, `?kinds=…&until=TIME`: up to the oldest post's time, that second included, in case its posts didn't all fit — unless the page started at that very second, and then one second before it, so the listing always moves on. Seeds: relay.damus.io, nos.lol, relay.primal.net, relay.snort.social, nostr.mom, purplepag.es. With `-c` the listings start again from the newest, skipping what the file has.
+- **Posts from listings are kept** (up to 50,000, the oldest let go first), so fetching them asks no relay; the authors of a listing page are asked for in one go, for their names. Anything else is looked for where it was last seen (a listing, a profile, a tag's relay hint, an `nevent`'s relays), then on two or three of the seeds: three relays at most before it's taken as gone.
+- **Relays** get one connection each, kept open, and one subscription at a time on it (`REQ`, events, `EOSE`, `CLOSE`), `--delay` apart. A connection that fails is opened again once; a relay that can't be reached three times in a row isn't asked again in this crawl. `CLOSED` with `rate-limited:` waits a minute; with any other reason (`auth-required:`, NIP-42: nothing is logged into) that page is gone. To the crawl, every post, profile and relay is a server of its own (§15.2): the waiting is done per relay, here.
+- **WebSocket:** RFC 6455's client side, as much as relays need: the HTTP upgrade (`101`), masked frames out, text messages in (in parts, too), pings answered; no compression. TLS accepts any certificate (§15.6): what's checked is the posts' signatures. `--proxy socks5://…` (Tor) works, and reaches `.onion` relays; an HTTP proxy doesn't.
+- **No robots.txt:** relays are servers for programs, and posts aren't sites.
+- Before crawling, the seeds are connected to at once: "Reached N of 6 relays." None at all stops the spider. Default timeout 20 s (a whole answer gets four times that).
+
+### 15.10 TON Sites (`ton.rs`)
+
+TON Sites are web sites on TON's network, served over RLDP (TON's own transport) and reached through a TON proxy, an HTTP proxy on this computer: `rldp-http-proxy` (`rldp-http-proxy -p 8080 -c 3333 -C global.config.json`) or Tonutils Proxy, at `http://127.0.0.1:8080` by default (`--proxy` for another; Kubo's gateway, §15.7, wants that port too).
+
+- **Addresses:** `http://NAME.ton/` (TON DNS names, subdomains too), `http://ADDRESS.adnl/` (a site by its ADNL address) and `http://BAG.bag/` (TON Storage). Only those are crawled: the proxy sends any other host to the ordinary web, so links to anything else (`https://`, gateways such as `NAME.ton.website`) aren't followed.
+- **Seeds:** foundation.ton, storage.ton, howtorunsite.ton, tondnsdomain.ton.
+- **Pages** as in §15.6 (HTML and text); robots.txt is obeyed. An answer of 500 or more is the proxy's (it couldn't reach the site): the site counts as unreachable.
+- **Waiting for the proxy:** before crawling, foundation.ton is asked for until it answers, for up to 5 minutes ("Waiting for the TON proxy to be able to reach sites…"); a proxy that isn't running at all stops the spider at once (is the TON proxy running?). Default timeout 60 s.
+
+### 15.11 Swarm (`swarm.rs`)
+
+Swarm is Ethereum's storage network: a site is a manifest (its files by path) under the hash of its content, fetched over HTTP from a gateway, `GET /bzz/HASH/path`: `https://api.gateway.ethswarm.org` by default (the Swarm Foundation's API gateway; `gateway.ethswarm.org` answers every address with the same empty app page), or `--gateway` for another, such as a Bee node's API at `http://127.0.0.1:1633`.
+
+- **Addresses:** `bzz://HASH/path` (64 hex digits, lowercase) or `bzz://NAME.eth/path` (ENS names, which the gateway looks up). Gateways' links become `bzz://` ones: `/bzz/HASH/…` on bzz.link or gateway.ethswarm.org (and their subdomains), `NAME.bzz.link` (`NAME.eth`) and `CID.bzz.link`. CIDs (`bah5…`: base32, version 1, the Swarm manifest or feed codec, a Keccak-256 multihash) are written as their hashes, wherever they are. Links written for gateways, `/bzz/HASH/…` on a page, are read as `bzz://HASH/…`. `bzz://` URLs written in text are links too; queries and fragments go.
+- **No listing:** nothing lists Swarm's sites, so the crawl only follows links, from the seeds: `bzz://swarm.eth/`, `bzz://fairdataprotocol.eth/` and a site the Swarm gateway guide links to by CID. `--link` adds others.
+- **Public gateways serve only some sites:** the Swarm gateway's default rules refuse websites asked for by hash, unless allowed, by sending the visitor to `/forbidden` (ENS names and single files are let through). That redirect isn't followed: the page is gone (it shows as "not found" in the crawl's summary). Before crawling, the gateway is asked for swarm.eth — one that can't be reached stops the spider — and, if it isn't on this computer, a line says that a Bee node of your own reaches all of Swarm.
+- **Redirects** the gateway makes to its own paths (a directory's `/` added) are followed, three at most; 500 or more is the gateway failing (unreachable). Pages as in §15.6; robots.txt is obeyed (a manifest can have one).
+- **Servers:** a gateway on this computer is asked about many sites at once; any other is one server, asked one thing at a time (`--delay`). Default timeout 60 s (content not cached anywhere yet is found on the network first).
+
+### 15.12 Spartan, Nex and Finger (`spartan.rs`, `nex.rs`, `finger.rs`)
+
+Three of the small internet's protocols, each plain TCP, one request a connection, the answer read until the server closes it (`net::exchange`). `--proxy` takes a SOCKS5 proxy (Tor), as for Gopher.
+
+- **Spartan** (`spartan://`, port 300): Gemini's sibling without TLS. The request is `HOST PATH 0` and CRLF (no data sent); the answer is a one-digit status, a space, a meta line, CRLF: `2 TYPE` and the document (gemtext when no type is given; read as Gemini's, §15.4, plus `spartan://` URLs written in the text), `3 PATH` moved (followed), `4` gone, `5` the server failing (tried later). Seeds: mozz.us, spartan.mozz.us. robots.txt as for Gemini.
+- **Nex** (`nex://`, port 1900): the request is the path and CRLF, the answer the file itself, with no status or type. A path ending in `/` is a directory, read as gemtext (its links are `=> URL label` lines); `.gmi` files are gemtext too; anything with a NUL byte isn't text (saved by its link); the rest is plain text. An empty answer is gone. Seed: nightfall.city.
+- **Finger** (`finger://HOST/USER`, port 79, RFC 1288): the request is the user name (none for the server's own page) and CRLF, the answer text about them, their `.plan`. Pages are titled `user@host` (the host, for its own page); links are the URLs written in the text (`finger://`, `gemini://`, `gopher://`, `spartan://`, `nex://`, `http(s)://`: only `finger://` ones are followed). No robots.txt (it would be a user's name); names with `@` (forwarding to another server) aren't asked for. Seeds: plan.cat, happynetbox.com. Nothing lists a server's users, so the crawl goes where `.plan`s link to.
 
 ---
 

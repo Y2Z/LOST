@@ -14,7 +14,11 @@ const TRACKING_PARAMS: &[&str] = &[
 pub struct Url {
     /// Lowercase scheme, e.g. `https`.
     pub scheme: String,
-    /// Lowercase host, without port or credentials.
+    /// Lowercase host, without port or credentials. Except for `ipfs://`,
+    /// `ipns://` and `ar://`, whose "hosts" are content IDs, keys and
+    /// Arweave transaction IDs, which mean something else in another case
+    /// (`Qm…`, `12D3Koo…` in base58; Arweave's in base64). For a Nostr URI
+    /// (`nostr:npub1…`, NIP-21), what follows `nostr:`.
     pub host: String,
     /// Port, if one was given and it isn't the scheme's default.
     pub port: Option<u16>,
@@ -28,9 +32,23 @@ pub struct Url {
 
 impl Url {
     /// Parses an absolute URL. Returns `None` for anything that isn't one.
+    ///
+    /// Nostr URIs have no `//` (`nostr:npub1…`): what follows `nostr:` is
+    /// kept as the host, lowercase (it's bech32, which has one case), with
+    /// `/` as the path. `nostr://npub1…` is taken as the same.
     pub fn parse(input: &str) -> Option<Url> {
         let input = input.trim();
-        let (scheme, rest) = input.split_once("://")?;
+        let Some((scheme, rest)) = input.split_once("://") else {
+            let (scheme, rest) = input.split_once(':')?;
+            return if scheme.eq_ignore_ascii_case("nostr") {
+                nostr(rest)
+            } else {
+                None
+            };
+        };
+        if scheme.eq_ignore_ascii_case("nostr") {
+            return nostr(rest);
+        }
         if scheme.is_empty()
             || !scheme
                 .chars()
@@ -55,6 +73,14 @@ impl Url {
         // Drop credentials.
         let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
 
+        let keep_case = keeps_case(&scheme);
+        let fold = |host: &str| {
+            if keep_case {
+                host.to_string()
+            } else {
+                host.to_ascii_lowercase()
+            }
+        };
         let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
             // IPv6 literal: [::1]:8080
             let (h, after) = stripped.split_once(']')?;
@@ -63,10 +89,10 @@ impl Url {
         } else {
             match authority.rsplit_once(':') {
                 Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                    (h.to_ascii_lowercase(), p.parse().ok())
+                    (fold(h), p.parse().ok())
                 }
-                Some((h, "")) => (h.to_ascii_lowercase(), None),
-                _ => (authority.to_ascii_lowercase(), None),
+                Some((h, "")) => (fold(h), None),
+                _ => (fold(authority), None),
             }
         };
         let host = host.trim_end_matches('.').to_string();
@@ -92,6 +118,9 @@ impl Url {
     /// - A trailing slash is removed from the path (except for the root `/`).
     /// - Route-style fragments of JavaScript apps (`#!/…`, `#/…`) are kept.
     pub fn normalized(&self) -> String {
+        if self.scheme == "nostr" {
+            return format!("nostr:{}", self.host);
+        }
         let scheme = match self.scheme.as_str() {
             "http" | "https" => "web",
             other => other,
@@ -155,6 +184,9 @@ impl Url {
 impl std::fmt::Display for Url {
     /// The URL written out again (without credentials).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.scheme == "nostr" {
+            return write!(f, "nostr:{}", self.host);
+        }
         write!(f, "{}://{}", self.scheme, self.host)?;
         if let Some(port) = self.port {
             write!(f, ":{port}")?;
@@ -168,6 +200,23 @@ impl std::fmt::Display for Url {
         }
         Ok(())
     }
+}
+
+/// A Nostr URI's entity (`npub1…`, `note1…`, `naddr1…`…): letters and
+/// digits only, up to a `/`, `?` or `#`.
+fn nostr(rest: &str) -> Option<Url> {
+    let entity = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if entity.is_empty() || !entity.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(Url {
+        scheme: "nostr".into(),
+        host: entity.to_ascii_lowercase(),
+        port: None,
+        path: "/".into(),
+        query: None,
+        fragment: None,
+    })
 }
 
 /// Resolves a link found on the page at `base` into an absolute `http(s)`
@@ -195,7 +244,7 @@ pub fn resolve_any(base: &Url, href: &str) -> Option<Url> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
     });
-    let absolute = if has_scheme {
+    let absolute = if has_scheme || lower.starts_with("nostr:") {
         Url::parse(href)?
     } else if lower.contains(':') && !lower.starts_with('/') && !lower.starts_with('?') {
         // Some other scheme (javascript:, mailto:, tel:, data:, …) — or a
@@ -294,6 +343,21 @@ fn uppercase_escapes(s: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a scheme's hosts are case-sensitive: content IDs and keys
+/// (`ipfs://`, `ipns://`, `ar://`), where `Qm…` and `qm…` are two things.
+pub fn keeps_case(scheme: &str) -> bool {
+    matches!(scheme, "ipfs" | "ipns" | "ar")
+}
+
+/// The host of `url` as it's looked up and sent: [`ascii_host`]'s, but
+/// untouched for a scheme whose hosts keep their case.
+pub fn wire_host(url: &Url) -> Option<String> {
+    if keeps_case(&url.scheme) {
+        return (!url.host.is_empty()).then(|| url.host.clone());
+    }
+    ascii_host(&url.host)
 }
 
 /// A host name as it's looked up and sent: internationalized labels in
@@ -444,6 +508,11 @@ fn default_port(scheme: &str) -> Option<u16> {
         "ftp" => Some(21),
         "gopher" => Some(70),
         "gemini" => Some(1965),
+        "spartan" => Some(300),
+        "nex" => Some(1900),
+        "finger" => Some(79),
+        "ws" => Some(80),
+        "wss" => Some(443),
         _ => None,
     }
 }
@@ -454,6 +523,30 @@ mod tests {
 
     fn norm(s: &str) -> String {
         Url::parse(s).unwrap().normalized()
+    }
+
+    #[test]
+    fn content_ids_keep_their_case() {
+        let cid = "QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR";
+        assert_eq!(Url::parse(&format!("ipfs://{cid}/a")).unwrap().host, cid);
+        assert_eq!(
+            Url::parse("IPNS://12D3KooWExample/").unwrap().host,
+            "12D3KooWExample"
+        );
+        assert_eq!(
+            Url::parse("https://Example.COM/").unwrap().host,
+            "example.com"
+        );
+        let tx = "bNbA3TEQVL60xlgCcqdz4ZPHFZ711cZ3hmkpGttDt_U";
+        assert_eq!(Url::parse(&format!("ar://{tx}/")).unwrap().host, tx);
+        // And as they're sent.
+        let url = Url::parse(&format!("ar://{tx}/")).unwrap();
+        assert_eq!(wire_host(&url).as_deref(), Some(tx));
+        let url = Url::parse(&format!("ipfs://{cid}/")).unwrap();
+        assert_eq!(wire_host(&url).as_deref(), Some(cid));
+        let mut url = Url::parse("gemini://example.org/").unwrap();
+        url.host = "Example.ORG".into();
+        assert_eq!(wire_host(&url).as_deref(), Some("example.org"));
     }
 
     #[test]
@@ -619,6 +712,37 @@ mod tests {
             Some("www.example.com")
         );
         assert_eq!(site_host("example.com/foo").as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn nostr_uris() {
+        let npub = "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg";
+        for written in [
+            format!("nostr:{npub}"),
+            format!("NOSTR:{}", npub.to_uppercase()),
+            format!("nostr://{npub}/"),
+            format!(" nostr:{npub}#x "),
+        ] {
+            let url = Url::parse(&written).unwrap();
+            assert_eq!(url.scheme, "nostr", "{written}");
+            assert_eq!(url.host, npub, "{written}");
+            assert_eq!(url.path, "/");
+            assert_eq!(url.to_string(), format!("nostr:{npub}"));
+            assert_eq!(url.normalized(), format!("nostr:{npub}"));
+        }
+        assert_eq!(Url::parse("nostr:"), None);
+        assert_eq!(Url::parse("nostr:not a thing"), None);
+        assert_eq!(Url::parse("mailto:someone@example.org"), None);
+        // As a link on a page.
+        let base = Url::parse("https://example.org/a/").unwrap();
+        assert_eq!(
+            resolve_any(&base, &format!("nostr:{npub}")).map(|u| u.to_string()),
+            Some(format!("nostr:{npub}"))
+        );
+        assert_eq!(resolve(&base, &format!("nostr:{npub}")), None);
+        // Relays' default ports.
+        assert_eq!(Url::parse("wss://relay.example:443/").unwrap().port, None);
+        assert_eq!(Url::parse("ws://relay.example:80").unwrap().port, None);
     }
 
     #[test]

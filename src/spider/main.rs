@@ -5,13 +5,22 @@
 //! LOST's library for the `.lost` format and your ID, and nothing in LOST
 //! knows it exists.
 
+mod arweave;
 mod crawl;
+mod finger;
 mod gemini;
 mod gopher;
 mod http;
 mod i2p;
+mod ipfs;
 mod net;
+mod nex;
+mod nostr;
 mod onion;
+mod spartan;
+mod swarm;
+mod ton;
+mod websocket;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -25,12 +34,20 @@ use lost::lostfile::{Reader, Writer};
 use lost::text::{format_bytes, thousands};
 use lost::urls::Url;
 
+use crate::arweave::Arweave;
 use crate::crawl::{Blacklist, Crawler, Known, Protocol, Settings};
+use crate::finger::Finger;
 use crate::gemini::Gemini;
 use crate::gopher::Gopher;
 use crate::i2p::I2p;
+use crate::ipfs::Ipfs;
 use crate::net::Proxy;
+use crate::nex::Nex;
+use crate::nostr::Nostr;
 use crate::onion::Onion;
+use crate::spartan::Spartan;
+use crate::swarm::Swarm;
+use crate::ton::Ton;
 
 const USAGE: &str = "\
 lost-spider — LOST's crawler. It crawls a network and saves what it finds
@@ -39,8 +56,19 @@ as a .lost file for LOST to import.
 Usage:
   lost-spider gemini [OPTIONS]    Crawl Geminispace
   lost-spider gopher [OPTIONS]    Crawl Gopherspace
+  lost-spider spartan [OPTIONS]   Crawl Spartan capsules
+  lost-spider nex [OPTIONS]       Crawl Nex servers
+  lost-spider finger [OPTIONS]    Crawl Finger servers (people's .plans)
   lost-spider onion [OPTIONS]     Crawl .onion sites, through Tor
   lost-spider i2p [OPTIONS]       Crawl I2P sites, through an I2P router
+  lost-spider ipfs [OPTIONS]      Crawl IPFS sites (and ENS names), through an
+                                  IPFS node's gateway
+  lost-spider arweave [OPTIONS]   Crawl Arweave (the permaweb), through a gateway
+  lost-spider nostr [OPTIONS]     Crawl Nostr: notes, articles and profiles,
+                                  from relays
+  lost-spider ton [OPTIONS]       Crawl TON Sites, through a TON proxy
+  lost-spider swarm [OPTIONS]     Crawl Swarm sites (and ENS names), through a
+                                  gateway
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -60,21 +88,32 @@ Options:
                           links: to add those pages to a file, and nothing else
       --search PHRASE     Type PHRASE into the search boxes found, and crawl
                           what they find (repeat for more). Only boxes that
-                          look like searches; never comment or password boxes
+                          look like searches; never comment or password boxes.
+                          nostr: searched for on the relays that can search
       --searches FILE     The same, one phrase a line
       --blacklist FILE    Skip URLs and pages that FILE lists, in this crawl
                           (domains, URL beginnings, /regex/, title:/regex/,
-                          body:/regex/; # starts a comment)
-      --delay SECONDS     Wait between two requests to the same server
-                          (default 1; decimals allowed)
+                          body:/regex/, nostr: npub1… for an author's posts;
+                          # starts a comment)
+      --delay SECONDS     Wait between two requests to the same server (or
+                          Nostr relay) (default 1; decimals allowed)
       --host-limit N      Save at most N pages from one host (default: no limit)
       --proxy URL         Go through a proxy: socks5://HOST:PORT (any network;
                           Tor's is socks5://127.0.0.1:9050) or http://HOST:PORT
-                          (I2P only). onion uses Tor's by default, i2p
-                          http://127.0.0.1:4444
+                          (I2P, TON, or an http:// IPFS gateway). onion uses
+                          Tor's by default, i2p http://127.0.0.1:4444, ton
+                          http://127.0.0.1:8080
+      --gateway URL       ipfs, arweave, swarm: the gateway to ask (defaults:
+                          ipfs http://127.0.0.1:8080, Kubo's; arweave
+                          https://turbo-gateway.com; swarm
+                          https://api.gateway.ethswarm.org, or a Bee node's
+                          http://127.0.0.1:1633). One that isn't on this
+                          computer is asked one thing at a time
   -t, --timeout SECONDS   How long to wait for a server to connect or send more
                           (a whole page gets four times that). Defaults: gopher
-                          10, gemini 15, either through a proxy 30, onion 60,
+                          and finger 10, gemini, spartan and nex 15, any of
+                          those through a proxy 30, nostr 20,
+                          arweave 30, onion 60, ipfs 60, ton 60, swarm 60,
                           i2p 120
   -h, --help              Show this help
   -V, --version           Show the version
@@ -101,6 +140,7 @@ struct Options {
     delay: Duration,
     host_limit: Option<u64>,
     proxy: Option<Proxy>,
+    gateway: Option<String>,
     timeout: Option<Duration>,
 }
 
@@ -129,12 +169,28 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
             println!("lost-spider {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        "gemini" => start(&args[1..], Gemini::new),
-        "gopher" => start(&args[1..], Gopher::new),
-        "onion" => start(&args[1..], Onion::new),
-        "i2p" => start(&args[1..], I2p::new),
+        "gemini" => start(&args[1..], |o| Gemini::new(o.proxy.take(), o.timeout)),
+        "gopher" => start(&args[1..], |o| Gopher::new(o.proxy.take(), o.timeout)),
+        "spartan" => start(&args[1..], |o| Spartan::new(o.proxy.take(), o.timeout)),
+        "nex" => start(&args[1..], |o| Nex::new(o.proxy.take(), o.timeout)),
+        "finger" => start(&args[1..], |o| Finger::new(o.proxy.take(), o.timeout)),
+        "onion" => start(&args[1..], |o| Onion::new(o.proxy.take(), o.timeout)),
+        "i2p" => start(&args[1..], |o| I2p::new(o.proxy.take(), o.timeout)),
+        "ipfs" => start(&args[1..], |o| {
+            Ipfs::new(o.gateway.take(), o.proxy.take(), o.timeout)
+        }),
+        "arweave" => start(&args[1..], |o| {
+            Arweave::new(o.gateway.take(), o.proxy.take(), o.timeout)
+        }),
+        "swarm" => start(&args[1..], |o| {
+            Swarm::new(o.gateway.take(), o.proxy.take(), o.timeout)
+        }),
+        "ton" => start(&args[1..], |o| Ton::new(o.proxy.take(), o.timeout)),
+        "nostr" => start(&args[1..], |o| {
+            Nostr::new(o.proxy.take(), o.timeout, o.delay, o.searches.clone())
+        }),
         other => Err(format!(
-            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p)"
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr, ton, swarm, spartan, nex, finger)"
         )
         .into()),
     }
@@ -143,13 +199,13 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
 /// Reads the options for network `P` and crawls it.
 fn start<P: Protocol>(
     args: &[String],
-    make: fn(Option<Proxy>, Option<Duration>) -> lost::Result<P>,
+    make: impl FnOnce(&mut Options) -> lost::Result<P>,
 ) -> lost::Result<ExitCode> {
     let Some(mut options) = parse_options::<P>(args)? else {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     };
-    let protocol = make(options.proxy.take(), options.timeout)?;
+    let protocol = make(&mut options)?;
     crawl(protocol, options)
 }
 
@@ -166,6 +222,7 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
         delay: Duration::from_secs(1),
         host_limit: None,
         proxy: None,
+        gateway: None,
         timeout: None,
     };
     let mut args = args.iter();
@@ -214,6 +271,12 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
                 options.host_limit = Some(limit);
             }
             "--proxy" => options.proxy = Some(Proxy::parse(&value()?)?),
+            "--gateway" if matches!(P::NAME, "ipfs" | "arweave" | "swarm") => {
+                options.gateway = Some(value()?)
+            }
+            "--gateway" => {
+                return Err("--gateway is for lost-spider ipfs, arweave and swarm".into());
+            }
             "-t" | "--timeout" => {
                 let text = value()?;
                 let seconds: f64 = text
@@ -239,11 +302,13 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
 /// network's scheme).
 fn link<P: Protocol>(text: &str) -> lost::Result<String> {
     let text = text.trim();
-    let full = if text.contains("://") {
+    // `nostr:npub1…` has no `//`.
+    let full = if text.contains("://") || Url::parse(text).is_some() {
         text.to_string()
     } else {
         format!("{}://{text}", P::SCHEME)
     };
+    let full = P::rewrite(&full).unwrap_or(full);
     match Url::parse(&full) {
         Some(url) if P::accepts(&url) => Ok(url.to_string()),
         _ => Err(format!("\"{text}\" isn't a link lost-spider {} can follow", P::NAME).into()),
@@ -272,6 +337,7 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
             let hint = match P::NAME {
                 "onion" => " (is Tor running?)",
                 "i2p" => " (is the I2P router running?)",
+                "ton" => " (is the TON proxy running?)",
                 _ => "",
             };
             format!("{e}{hint}")
@@ -345,12 +411,17 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
     };
     let status = |pages: u64| {
         let stats = crawler.stats();
+        let skipped = match stats.skipped.total() {
+            0 => String::new(),
+            n => format!(" · {} skipped", thousands(n)),
+        };
         format!(
-            "{} {} for {}… {} pages saved · {} {} · {} links waiting",
+            "{} {} for {}… {} pages saved{} · {} {} · {} links waiting",
             verb,
             P::SPACE,
             duration(started.elapsed()),
             thousands(pages),
+            skipped,
             thousands(stats.hosts as u64),
             P::HOSTS,
             thousands(stats.waiting),
@@ -428,8 +499,31 @@ fn crawl<P: Protocol>(protocol: P, options: Options) -> lost::Result<ExitCode> {
             path.display()
         );
     }
+    if let Some(line) = skipped_line(crawler.stats().skipped) {
+        eprintln!("{line}");
+    }
     eprintln!("To search them: lost -d \"{}\"", path.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Why pages weren't saved, when some weren't: "Not saved: 40 copies of
+/// pages saved already, 3 not found."
+fn skipped_line(skipped: crawl::Skipped) -> Option<String> {
+    let parts: Vec<String> = [
+        (
+            skipped.copies,
+            "copy of a page saved already",
+            "copies of pages saved already",
+        ),
+        (skipped.gone, "not found", "not found"),
+        (skipped.unreachable, "unreachable", "unreachable"),
+        (skipped.blocked, "blacklisted", "blacklisted"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| format!("{} {}", thousands(n), if n == 1 { one } else { many }))
+    .collect();
+    (!parts.is_empty()).then(|| format!("Not saved: {}.", parts.join(", ")))
 }
 
 /// "6 hours, 15 minutes, 56 seconds": the units from the largest one there
@@ -637,6 +731,27 @@ mod tests {
         assert!(parse_options::<Onion>(&args(&["--link", "example.org"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--proxy", "localhost:9050"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["-t", "0"])).is_err());
+        // Nostr's links: a URI, a bare entity, a relay.
+        let npub = "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg";
+        let o = parse_options::<Nostr>(&args(&[
+            "--link",
+            &format!("nostr:{npub}"),
+            "--link",
+            npub,
+            "--link",
+            "wss://relay.example",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            o.links,
+            [
+                format!("nostr:{npub}"),
+                format!("nostr:{npub}"),
+                "wss://relay.example/".to_string()
+            ]
+        );
+        assert!(parse_options::<Nostr>(&args(&["--link", "https://example.org/"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["-c"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--dont-crawl"])).is_err());
         let o = parse_options::<Gemini>(&args(&["--dont-crawl", "--link", "a.org"]));
@@ -651,6 +766,30 @@ mod tests {
         assert!(parse_options::<Gemini>(&args(&["--link", "https://x.org/"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--delay", "-1"])).is_err());
         assert!(parse_options::<Gemini>(&args(&["--bogus"])).is_err());
+        // IPFS: a gateway, and links written the one way.
+        let o = parse_options::<Ipfs>(&args(&[
+            "--gateway",
+            "https://ipfs.io",
+            "--link",
+            "docs.ipfs.tech",
+            "--link",
+            "QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR",
+            "--link",
+            "https://ipfs.io/ipfs/QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR/a",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(o.gateway.as_deref(), Some("https://ipfs.io"));
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        assert_eq!(
+            o.links,
+            [
+                "ipns://docs.ipfs.tech/".to_string(),
+                format!("ipfs://{cid}/"),
+                format!("ipfs://{cid}/a"),
+            ]
+        );
+        assert!(parse_options::<Gemini>(&args(&["--gateway", "http://x:1"])).is_err());
         assert!(
             parse_options::<Gemini>(&args(&["--help"]))
                 .unwrap()
