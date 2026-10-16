@@ -7,14 +7,17 @@
 
 mod arweave;
 mod crawl;
+mod finger;
 mod gemini;
 mod gopher;
 mod http;
 mod i2p;
 mod ipfs;
 mod net;
+mod nex;
 mod nostr;
 mod onion;
+mod spartan;
 mod swarm;
 mod ton;
 mod websocket;
@@ -33,13 +36,16 @@ use lost::urls::Url;
 
 use crate::arweave::Arweave;
 use crate::crawl::{Blacklist, Crawler, Known, Protocol, Settings};
+use crate::finger::Finger;
 use crate::gemini::Gemini;
 use crate::gopher::Gopher;
 use crate::i2p::I2p;
 use crate::ipfs::Ipfs;
 use crate::net::Proxy;
+use crate::nex::Nex;
 use crate::nostr::Nostr;
 use crate::onion::Onion;
+use crate::spartan::Spartan;
 use crate::swarm::Swarm;
 use crate::ton::Ton;
 
@@ -50,6 +56,9 @@ as a .lost file for LOST to import.
 Usage:
   lost-spider gemini [OPTIONS]    Crawl Geminispace
   lost-spider gopher [OPTIONS]    Crawl Gopherspace
+  lost-spider spartan [OPTIONS]   Crawl Spartan capsules
+  lost-spider nex [OPTIONS]       Crawl Nex servers
+  lost-spider finger [OPTIONS]    Crawl Finger servers (people's .plans)
   lost-spider onion [OPTIONS]     Crawl .onion sites, through Tor
   lost-spider i2p [OPTIONS]       Crawl I2P sites, through an I2P router
   lost-spider ipfs [OPTIONS]      Crawl IPFS sites (and ENS names), through an
@@ -102,7 +111,8 @@ Options:
                           computer is asked one thing at a time
   -t, --timeout SECONDS   How long to wait for a server to connect or send more
                           (a whole page gets four times that). Defaults: gopher
-                          10, gemini 15, either through a proxy 30, nostr 20,
+                          and finger 10, gemini, spartan and nex 15, any of
+                          those through a proxy 30, nostr 20,
                           arweave 30, onion 60, ipfs 60, ton 60, swarm 60,
                           i2p 120
   -h, --help              Show this help
@@ -161,6 +171,9 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
         }
         "gemini" => start(&args[1..], |o| Gemini::new(o.proxy.take(), o.timeout)),
         "gopher" => start(&args[1..], |o| Gopher::new(o.proxy.take(), o.timeout)),
+        "spartan" => start(&args[1..], |o| Spartan::new(o.proxy.take(), o.timeout)),
+        "nex" => start(&args[1..], |o| Nex::new(o.proxy.take(), o.timeout)),
+        "finger" => start(&args[1..], |o| Finger::new(o.proxy.take(), o.timeout)),
         "onion" => start(&args[1..], |o| Onion::new(o.proxy.take(), o.timeout)),
         "i2p" => start(&args[1..], |o| I2p::new(o.proxy.take(), o.timeout)),
         "ipfs" => start(&args[1..], |o| {
@@ -177,7 +190,7 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
             Nostr::new(o.proxy.take(), o.timeout, o.delay, o.searches.clone())
         }),
         other => Err(format!(
-            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr, ton, swarm)"
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr, ton, swarm, spartan, nex, finger)"
         )
         .into()),
     }

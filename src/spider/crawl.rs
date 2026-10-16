@@ -176,6 +176,9 @@ pub fn port(url: &Url) -> u16 {
     url.port.unwrap_or(match url.scheme.as_str() {
         "gemini" => 1965,
         "gopher" => 70,
+        "spartan" => 300,
+        "nex" => 1900,
+        "finger" => 79,
         "https" => 443,
         _ => 80,
     })

@@ -76,7 +76,7 @@ LOST searches through whatever datasets you import.  It comes out of the box wit
 - Common Crawl (WET and WAT files)
 - Hacker News (BigQuery CSV export)
 - `.lost` files — LOST's own format
-- Gemini, Gopher, `.onion`, I2P, IPFS, Arweave, Nostr, TON and Swarm — crawled with `lost-spider` (see [below](#crawling-gemini-gopher-onion-i2p-ipfs-arweave-nostr-ton-and-swarm))
+- Gemini, Gopher, Spartan, Nex, Finger, `.onion`, I2P, IPFS, Arweave, Nostr, TON and Swarm — crawled with `lost-spider` (see [below](#crawling-the-small-internet-darknets-and-web3))
 
 
 ### Datasets
@@ -104,9 +104,9 @@ SELECT * FROM `bigquery-public-data.hacker_news.full` WHERE timestamp >= '2026-0
 
 LOST is capable of importing and exporting `.lost` dataset files, which makes it possible to freely and safely exchange crawl data with other LOST users.  They aren't signed unless you ask (`lost -e FILE --sign`, or the "Sign it" checkbox): a signature lets others tell which files are yours and keeps your database from getting corrupted or spammed, but it also says who made the file.  Both exports and imports can be made either via CLI (see [Usage](#working-with-datasets)) or GUI (Settings → Data).
 
-#### Crawling: Gemini, Gopher, .onion, I2P, IPFS, Arweave, Nostr, TON and Swarm
+#### Crawling: the small internet, darknets and web3
 
-LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/), Gopherspace, `.onion` sites, I2P sites, [IPFS](https://ipfs.tech/), [Arweave](https://arweave.org/), [Nostr](https://nostr.com/), [TON Sites](https://docs.ton.org/foundations/web3/ton-sites) and [Swarm](https://www.ethswarm.org/) there's `lost-spider`, a separate crawler that isn't built or installed by default:
+LOST itself never goes online.  For [Geminispace](https://geminiprotocol.net/), Gopherspace, Spartan, Nex and Finger, `.onion` sites, I2P sites, [IPFS](https://ipfs.tech/), [Arweave](https://arweave.org/), [Nostr](https://nostr.com/), [TON Sites](https://docs.ton.org/foundations/web3/ton-sites) and [Swarm](https://www.ethswarm.org/) there's `lost-spider`, a separate crawler that isn't built or installed by default:
 
 ```console
 cargo install lost --features spider               # or: make spider
@@ -115,6 +115,9 @@ lost-spider gemini --link example.org -o my.lost   # start at a capsule nothing 
 lost-spider gemini --link example.org --dont-crawl # only that page, nothing else
 lost-spider gemini -c -o my.lost                   # carry on where it stopped
 lost-spider gopher                                 # crawl all of Gopherspace
+lost-spider spartan                                # Spartan capsules (Gemini without TLS)
+lost-spider nex                                    # Nex servers
+lost-spider finger --link finger://plan.cat/someone # people's .plans
 lost-spider onion                                  # .onion sites, through Tor (127.0.0.1:9050)
 lost-spider i2p                                    # I2P sites, through an I2P router (127.0.0.1:4444)
 lost-spider ipfs                                   # IPFS sites, through an IPFS node's gateway (127.0.0.1:8080)

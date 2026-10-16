@@ -215,7 +215,7 @@ fn parse_status(line: &str) -> Option<(u8, &str)> {
 }
 
 /// `text/gemini; charset=utf-8; lang=en` → `text/gemini`.
-fn mime_type(mime: &str) -> String {
+pub(crate) fn mime_type(mime: &str) -> String {
     mime.split(';')
         .next()
         .unwrap_or("")
@@ -227,7 +227,7 @@ fn is_text(mime: &str) -> bool {
     mime_type(mime).starts_with("text/")
 }
 
-fn charset(mime: &str) -> Option<String> {
+pub(crate) fn charset(mime: &str) -> Option<String> {
     mime.split(';').skip(1).find_map(|param| {
         let (name, value) = param.split_once('=')?;
         name.trim()
@@ -238,7 +238,7 @@ fn charset(mime: &str) -> Option<String> {
 
 /// UTF-8 unless the server says Latin-1; anything else is read as UTF-8,
 /// with what doesn't fit replaced.
-fn decode(bytes: &[u8], charset: Option<&str>) -> String {
+pub(crate) fn decode(bytes: &[u8], charset: Option<&str>) -> String {
     match charset {
         Some(
             "iso-8859-1" | "iso8859-1" | "latin1" | "latin-1" | "l1" | "windows-1252" | "cp1252",
@@ -252,7 +252,7 @@ fn decode(bytes: &[u8], charset: Option<&str>) -> String {
 /// drops the markup (`=>`, `#`, `*`, `>`), and preformatted blocks stay
 /// as they are. Links are every `=>` line, plus `gemini://` URLs written
 /// in the text.
-fn gemtext(base: &Url, text: &str) -> Parsed {
+pub(crate) fn gemtext(base: &Url, text: &str) -> Parsed {
     let mut lines: Vec<&str> = Vec::new();
     let mut links: Vec<Link> = Vec::new();
     let mut title: Option<&str> = None;

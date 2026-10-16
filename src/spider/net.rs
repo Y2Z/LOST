@@ -98,6 +98,50 @@ pub fn connect(
     Ok(stream)
 }
 
+/// One request on a plain connection, the way the small protocols go
+/// (Spartan, Nex, Finger): `request` sent, then everything until the
+/// server closes, at most `max` bytes, the whole of it within four times
+/// `timeout`. A server that resets the connection after its answer has
+/// still answered.
+pub fn exchange(
+    route: Route,
+    proxy: Option<&Proxy>,
+    host: &str,
+    port: u16,
+    request: &str,
+    timeout: Duration,
+    max: usize,
+) -> Result<Vec<u8>, String> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let mut stream = connect(route, proxy, host, port, timeout)?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    let mut body = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    while body.len() < max {
+        if started.elapsed() > timeout * 4 {
+            return Err("too slow".into());
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&buffer[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    body.truncate(max);
+    Ok(body)
+}
+
 /// SOCKS5 (RFC 1928), no authentication, connecting by name.
 fn socks5(stream: &mut TcpStream, host: &str, port: u16) -> Result<(), String> {
     let io = |e: std::io::Error| format!("proxy: {e}");

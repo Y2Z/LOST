@@ -794,6 +794,9 @@ lost/
         ├── http.rs           HTTP/1.1 and HTML, for the web networks
         ├── gemini.rs         Gemini: TLS, responses, gemtext
         ├── gopher.rs         Gopher: selectors, menus
+        ├── spartan.rs        Spartan: Gemini without TLS
+        ├── nex.rs            Nex: paths, directories
+        ├── finger.rs         Finger: people's .plans
         ├── onion.rs          .onion sites through Tor; Ahmia's banned list
         ├── i2p.rs            I2P sites through a router; address books
         ├── ipfs.rs           IPFS through a gateway; CIDs, one way to write them
@@ -859,7 +862,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
                     [--host-limit N] [--proxy URL] [--gateway URL] [-t SECONDS]
 ```
 
-`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7), `arweave` (§15.8), `nostr` (§15.9), `ton` (§15.10) or `swarm` (§15.11); the options are the same for each, but for `--gateway`, which is `ipfs`'s, `arweave`'s and `swarm`'s.
+`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7), `arweave` (§15.8), `nostr` (§15.9), `ton` (§15.10), `swarm` (§15.11), or `spartan`, `nex` or `finger` (§15.12); the options are the same for each, but for `--gateway`, which is `ipfs`'s, `arweave`'s and `swarm`'s.
 
 | Option | What it does |
 |---|---|
@@ -874,7 +877,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
 | `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`, `ton` `http://127.0.0.1:8080`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
 | `--gateway URL` | `ipfs`, `arweave` and `swarm`: the gateway to ask, `http://HOST:PORT` or `https://HOST` (`arweave`: default `https://turbo-gateway.com`, §15.8; `swarm`: default `https://api.gateway.ethswarm.org`, or a Bee node's `http://127.0.0.1:1633`, §15.11; `ipfs`: default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
-| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Nostr 20 s, Arweave 30 s, IPFS 60 s, TON 60 s, Swarm 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
+| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher and Finger 10 s, Gemini, Spartan and Nex 15 s, any of those through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Nostr 20 s, Arweave 30 s, IPFS 60 s, TON 60 s, Swarm 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Unsigned ("Saving to NAME, unsigned."), or with `--sign` signed with your ID ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."). If `--sign` is given and the ID can't be read or made, the spider stops before crawling rather than leave the file unsigned.
@@ -1012,6 +1015,14 @@ Swarm is Ethereum's storage network: a site is a manifest (its files by path) un
 - **Public gateways serve only some sites:** the Swarm gateway's default rules refuse websites asked for by hash, unless allowed, by sending the visitor to `/forbidden` (ENS names and single files are let through). That redirect isn't followed: the page is gone (it shows as "not found" in the crawl's summary). Before crawling, the gateway is asked for swarm.eth — one that can't be reached stops the spider — and, if it isn't on this computer, a line says that a Bee node of your own reaches all of Swarm.
 - **Redirects** the gateway makes to its own paths (a directory's `/` added) are followed, three at most; 500 or more is the gateway failing (unreachable). Pages as in §15.6; robots.txt is obeyed (a manifest can have one).
 - **Servers:** a gateway on this computer is asked about many sites at once; any other is one server, asked one thing at a time (`--delay`). Default timeout 60 s (content not cached anywhere yet is found on the network first).
+
+### 15.12 Spartan, Nex and Finger (`spartan.rs`, `nex.rs`, `finger.rs`)
+
+Three of the small internet's protocols, each plain TCP, one request a connection, the answer read until the server closes it (`net::exchange`). `--proxy` takes a SOCKS5 proxy (Tor), as for Gopher.
+
+- **Spartan** (`spartan://`, port 300): Gemini's sibling without TLS. The request is `HOST PATH 0` and CRLF (no data sent); the answer is a one-digit status, a space, a meta line, CRLF: `2 TYPE` and the document (gemtext when no type is given; read as Gemini's, §15.4, plus `spartan://` URLs written in the text), `3 PATH` moved (followed), `4` gone, `5` the server failing (tried later). Seeds: mozz.us, spartan.mozz.us. robots.txt as for Gemini.
+- **Nex** (`nex://`, port 1900): the request is the path and CRLF, the answer the file itself, with no status or type. A path ending in `/` is a directory, read as gemtext (its links are `=> URL label` lines); `.gmi` files are gemtext too; anything with a NUL byte isn't text (saved by its link); the rest is plain text. An empty answer is gone. Seed: nightfall.city.
+- **Finger** (`finger://HOST/USER`, port 79, RFC 1288): the request is the user name (none for the server's own page) and CRLF, the answer text about them, their `.plan`. Pages are titled `user@host` (the host, for its own page); links are the URLs written in the text (`finger://`, `gemini://`, `gopher://`, `spartan://`, `nex://`, `http(s)://`: only `finger://` ones are followed). No robots.txt (it would be a user's name); names with `@` (forwarding to another server) aren't asked for. Seeds: plan.cat, happynetbox.com. Nothing lists a server's users, so the crawl goes where `.plan`s link to.
 
 ---
 
