@@ -800,6 +800,7 @@ lost/
         ├── arweave.rs        Arweave through a gateway; GraphQL listings, ArNS
         ├── nostr.rs          Nostr relays: listings, posts, profiles, NIP-19
         ├── ton.rs            TON Sites through a TON proxy
+        ├── swarm.rs          Swarm through a gateway; ENS names, bzz.link, CIDs
         └── websocket.rs      WebSocket (RFC 6455), for Nostr relays
 ```
 
@@ -858,7 +859,7 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
                     [--host-limit N] [--proxy URL] [--gateway URL] [-t SECONDS]
 ```
 
-`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7), `arweave` (§15.8), `nostr` (§15.9) or `ton` (§15.10); the options are the same for each, but for `--gateway`, which is `ipfs`'s and `arweave`'s.
+`NETWORK` is `gemini` (§15.4), `gopher` (§15.5), `onion` or `i2p` (§15.6), `ipfs` (§15.7), `arweave` (§15.8), `nostr` (§15.9), `ton` (§15.10) or `swarm` (§15.11); the options are the same for each, but for `--gateway`, which is `ipfs`'s, `arweave`'s and `swarm`'s.
 
 | Option | What it does |
 |---|---|
@@ -872,8 +873,8 @@ lost-spider NETWORK [-o PATH] [-c] [--link URL]… [--links FILE] [--dont-crawl]
 | `--delay SECONDS` | Between two requests to the same server (for `nostr`, the same relay); default 1, decimals allowed |
 | `--host-limit N` | Pages saved per host at most, counting those already in the file; default: no limit |
 | `--proxy URL` | Go through a proxy (`net.rs`): `socks5://HOST:PORT` for any network (Tor's is `socks5://127.0.0.1:9050`; host names are resolved by the proxy, so nothing reaches the local DNS, and Gemini and Gopher on `.onion` addresses become reachable), or `http://HOST:PORT` for I2P's HTTP proxy, which is sent whole requests. `onion` uses Tor's by default, `i2p` `http://127.0.0.1:4444`, `ton` `http://127.0.0.1:8080`. Checked before anything else: nothing answering there stops the spider with a message (is Tor running?) |
-| `--gateway URL` | `ipfs` and `arweave`: the gateway to ask, `http://HOST:PORT` or `https://HOST` (`arweave`: default `https://turbo-gateway.com`, §15.8; `ipfs`: default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
-| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Nostr 20 s, Arweave 30 s, IPFS 60 s, TON 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
+| `--gateway URL` | `ipfs`, `arweave` and `swarm`: the gateway to ask, `http://HOST:PORT` or `https://HOST` (`arweave`: default `https://turbo-gateway.com`, §15.8; `swarm`: default `https://api.gateway.ethswarm.org`, or a Bee node's `http://127.0.0.1:1633`, §15.11; `ipfs`: default `http://127.0.0.1:8080`, Kubo's path gateway; `localhost` is asked as `127.0.0.1`, since Kubo's gateway there sends every request on to a subdomain). A gateway on this computer is asked about many sites at once; any other (a public gateway such as `https://ipfs.io`) counts as one server, asked one thing at a time (`--delay`). `--proxy` reaches a gateway elsewhere through Tor, say |
+| `-t`, `--timeout SECONDS` | How long to wait for a server to connect, or to send the next bit of an answer; a whole answer gets four times that. Defaults: Gopher 10 s, Gemini 15 s, either through a proxy 30 s (Tor adds a few seconds a hop), `.onion` 60 s, Nostr 20 s, Arweave 30 s, IPFS 60 s, TON 60 s, Swarm 60 s (content found on the network for the first time), I2P 120 s (reaching a site for the first time can take a minute or more while the router builds tunnels) |
 
 - Nothing given on the command line is stored, so `-c` needs the options again.
 - Unsigned ("Saving to NAME, unsigned."), or with `--sign` signed with your ID ("Saving to NAME, signed as 3f9a 1c2e 77b0 1d4e."). If `--sign` is given and the ID can't be read or made, the spider stops before crawling rather than leave the file unsigned.
@@ -1001,6 +1002,16 @@ TON Sites are web sites on TON's network, served over RLDP (TON's own transport)
 - **Seeds:** foundation.ton, storage.ton, howtorunsite.ton, tondnsdomain.ton.
 - **Pages** as in §15.6 (HTML and text); robots.txt is obeyed. An answer of 500 or more is the proxy's (it couldn't reach the site): the site counts as unreachable.
 - **Waiting for the proxy:** before crawling, foundation.ton is asked for until it answers, for up to 5 minutes ("Waiting for the TON proxy to be able to reach sites…"); a proxy that isn't running at all stops the spider at once (is the TON proxy running?). Default timeout 60 s.
+
+### 15.11 Swarm (`swarm.rs`)
+
+Swarm is Ethereum's storage network: a site is a manifest (its files by path) under the hash of its content, fetched over HTTP from a gateway, `GET /bzz/HASH/path`: `https://api.gateway.ethswarm.org` by default (the Swarm Foundation's API gateway; `gateway.ethswarm.org` answers every address with the same empty app page), or `--gateway` for another, such as a Bee node's API at `http://127.0.0.1:1633`.
+
+- **Addresses:** `bzz://HASH/path` (64 hex digits, lowercase) or `bzz://NAME.eth/path` (ENS names, which the gateway looks up). Gateways' links become `bzz://` ones: `/bzz/HASH/…` on bzz.link or gateway.ethswarm.org (and their subdomains), `NAME.bzz.link` (`NAME.eth`) and `CID.bzz.link`. CIDs (`bah5…`: base32, version 1, the Swarm manifest or feed codec, a Keccak-256 multihash) are written as their hashes, wherever they are. Links written for gateways, `/bzz/HASH/…` on a page, are read as `bzz://HASH/…`. `bzz://` URLs written in text are links too; queries and fragments go.
+- **No listing:** nothing lists Swarm's sites, so the crawl only follows links, from the seeds: `bzz://swarm.eth/`, `bzz://fairdataprotocol.eth/` and a site the Swarm gateway guide links to by CID. `--link` adds others.
+- **Public gateways serve only some sites:** the Swarm gateway's default rules refuse websites asked for by hash, unless allowed, by sending the visitor to `/forbidden` (ENS names and single files are let through). That redirect isn't followed: the page is gone (it shows as "not found" in the crawl's summary). Before crawling, the gateway is asked for swarm.eth — one that can't be reached stops the spider — and, if it isn't on this computer, a line says that a Bee node of your own reaches all of Swarm.
+- **Redirects** the gateway makes to its own paths (a directory's `/` added) are followed, three at most; 500 or more is the gateway failing (unreachable). Pages as in §15.6; robots.txt is obeyed (a manifest can have one).
+- **Servers:** a gateway on this computer is asked about many sites at once; any other is one server, asked one thing at a time (`--delay`). Default timeout 60 s (content not cached anywhere yet is found on the network first).
 
 ---
 

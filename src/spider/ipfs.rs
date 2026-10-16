@@ -443,7 +443,7 @@ fn multibase(text: &str) -> Option<Vec<u8>> {
 }
 
 /// An unsigned LEB128 number, and what follows it.
-fn varint(bytes: &[u8]) -> Option<(u64, &[u8])> {
+pub(crate) fn varint(bytes: &[u8]) -> Option<(u64, &[u8])> {
     let mut value = 0u64;
     for (i, &b) in bytes.iter().enumerate().take(9) {
         value |= u64::from(b & 0x7f) << (7 * i);
@@ -506,7 +506,7 @@ fn base_encode(bytes: &[u8], alphabet: &[u8]) -> String {
 }
 
 /// RFC 4648 base32, lowercase, without padding.
-fn base32_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn base32_decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() * 5 / 8);
     let (mut bits, mut count) = (0u32, 0);
     for c in text.bytes() {

@@ -15,6 +15,7 @@ mod ipfs;
 mod net;
 mod nostr;
 mod onion;
+mod swarm;
 mod ton;
 mod websocket;
 
@@ -39,6 +40,7 @@ use crate::ipfs::Ipfs;
 use crate::net::Proxy;
 use crate::nostr::Nostr;
 use crate::onion::Onion;
+use crate::swarm::Swarm;
 use crate::ton::Ton;
 
 const USAGE: &str = "\
@@ -56,6 +58,8 @@ Usage:
   lost-spider nostr [OPTIONS]     Crawl Nostr: notes, articles and profiles,
                                   from relays
   lost-spider ton [OPTIONS]       Crawl TON Sites, through a TON proxy
+  lost-spider swarm [OPTIONS]     Crawl Swarm sites (and ENS names), through a
+                                  gateway
 
 Options:
   -o, --output PATH       Where to save: a .lost file, or a folder to put one in
@@ -90,14 +94,17 @@ Options:
                           (I2P, TON, or an http:// IPFS gateway). onion uses
                           Tor's by default, i2p http://127.0.0.1:4444, ton
                           http://127.0.0.1:8080
-      --gateway URL       ipfs, arweave: the gateway to ask (defaults: ipfs
-                          http://127.0.0.1:8080, Kubo's; arweave
-                          https://turbo-gateway.com). One that isn't on this
+      --gateway URL       ipfs, arweave, swarm: the gateway to ask (defaults:
+                          ipfs http://127.0.0.1:8080, Kubo's; arweave
+                          https://turbo-gateway.com; swarm
+                          https://api.gateway.ethswarm.org, or a Bee node's
+                          http://127.0.0.1:1633). One that isn't on this
                           computer is asked one thing at a time
   -t, --timeout SECONDS   How long to wait for a server to connect or send more
                           (a whole page gets four times that). Defaults: gopher
                           10, gemini 15, either through a proxy 30, nostr 20,
-                          arweave 30, onion 60, ipfs 60, ton 60, i2p 120
+                          arweave 30, onion 60, ipfs 60, ton 60, swarm 60,
+                          i2p 120
   -h, --help              Show this help
   -V, --version           Show the version
 
@@ -162,12 +169,15 @@ fn run(args: Vec<String>) -> lost::Result<ExitCode> {
         "arweave" => start(&args[1..], |o| {
             Arweave::new(o.gateway.take(), o.proxy.take(), o.timeout)
         }),
+        "swarm" => start(&args[1..], |o| {
+            Swarm::new(o.gateway.take(), o.proxy.take(), o.timeout)
+        }),
         "ton" => start(&args[1..], |o| Ton::new(o.proxy.take(), o.timeout)),
         "nostr" => start(&args[1..], |o| {
             Nostr::new(o.proxy.take(), o.timeout, o.delay, o.searches.clone())
         }),
         other => Err(format!(
-            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr, ton)"
+            "unknown network \"{other}\" (lost-spider knows: gemini, gopher, onion, i2p, ipfs, arweave, nostr, ton, swarm)"
         )
         .into()),
     }
@@ -248,10 +258,12 @@ fn parse_options<P: Protocol>(args: &[String]) -> lost::Result<Option<Options>> 
                 options.host_limit = Some(limit);
             }
             "--proxy" => options.proxy = Some(Proxy::parse(&value()?)?),
-            "--gateway" if matches!(P::NAME, "ipfs" | "arweave") => {
+            "--gateway" if matches!(P::NAME, "ipfs" | "arweave" | "swarm") => {
                 options.gateway = Some(value()?)
             }
-            "--gateway" => return Err("--gateway is for lost-spider ipfs and arweave".into()),
+            "--gateway" => {
+                return Err("--gateway is for lost-spider ipfs, arweave and swarm".into());
+            }
             "-t" | "--timeout" => {
                 let text = value()?;
                 let seconds: f64 = text
