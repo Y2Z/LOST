@@ -264,7 +264,7 @@ Sources that aren't web pages are turned into pages at import time. A Hacker New
 | `links` | string, multi-valued | yes | Outgoing links; `link:` with a full URL |
 | `link_hosts` | string, multi-valued | no | Every level of every linked host, reversed (like `host_rev`); `link:` with a site |
 | `link_ext` | string, multi-valued | no | The file extensions of the links (`pdf`, `zip`, …); `contains:` |
-| `lang` | string | no | The page's language, an ISO 639-3 code (`deu`), detected from its title and the first 1,000 characters of its text when it's indexed (`whatlang`, 70 languages); none when the text is too short or too mixed to tell. Not stored with the page: it's worked out again whenever the index is built. `lang:` |
+| `lang` | string | no | The page's language, an ISO 639-3 code (`deu`), detected from its title and the first 1,000 characters of its text when it's indexed (`whatlang`, 70 languages) — or, if that can't tell and the page is longer, from 20,000 characters out of its middle (past the menus and banners at the top); none when the text is too short or too mixed to tell. Not stored with the page: it's worked out again whenever the index is built. `lang:` |
 | `crawled` | date | yes | When the page was captured |
 | `import_id` | u64, indexed | yes | The import this version of the page came from |
 

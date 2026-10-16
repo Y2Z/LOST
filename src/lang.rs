@@ -11,9 +11,13 @@
 /// How much of a page is read to tell its language: enough to be sure,
 /// little enough not to slow imports down.
 const SAMPLE_CHARS: usize = 1_000;
+/// When that isn't enough to tell (menus, banners, an interface in another
+/// language at the top), this much from the middle of a longer page.
+const SECOND_SAMPLE_CHARS: usize = 20_000;
 
 /// The language of a page, as an ISO 639-3 code, or `None` when its text is
-/// too short or too mixed to tell.
+/// too short or too mixed to tell. The title and the start of the page
+/// first; failing that, if there's more to the page, its middle.
 pub fn detect(title: Option<&str>, body: &str) -> Option<&'static str> {
     let mut sample = String::with_capacity(SAMPLE_CHARS * 2);
     if let Some(title) = title {
@@ -21,8 +25,33 @@ pub fn detect(title: Option<&str>, body: &str) -> Option<&'static str> {
         sample.push('\n');
     }
     sample.extend(body.chars().take(SAMPLE_CHARS));
-    let info = whatlang::detect(&sample)?;
+    if let Some(code) = reliable(&sample) {
+        return Some(code);
+    }
+    let length = body.chars().count();
+    if length <= SAMPLE_CHARS {
+        // The whole page was read already.
+        return None;
+    }
+    reliable(middle(body, length, SECOND_SAMPLE_CHARS))
+}
+
+fn reliable(text: &str) -> Option<&'static str> {
+    let info = whatlang::detect(text)?;
     info.is_reliable().then(|| info.lang().code())
+}
+
+/// `chars` characters from the middle of `text` (`length` characters long),
+/// or all of it if it isn't longer.
+fn middle(text: &str, length: usize, chars: usize) -> &str {
+    if length <= chars {
+        return text;
+    }
+    let skip = (length - chars) / 2;
+    let mut ends = text.char_indices().map(|(i, _)| i).skip(skip);
+    let start = ends.next().unwrap_or(text.len());
+    let end = ends.nth(chars - 1).unwrap_or(text.len());
+    &text[start..end]
 }
 
 /// Other ways to write the languages `whatlang` knows: ISO 639-1 codes,
@@ -193,5 +222,35 @@ mod tests {
         // Too little to tell.
         assert_eq!(detect(Some("Welcome"), ""), None);
         assert_eq!(detect(None, ""), None);
+    }
+
+    #[test]
+    fn a_second_look() {
+        let german = "Das ist ein ganz normaler deutscher Satz über das Wetter in Berlin \
+                      und die vielen schönen Häuser der Stadt. ";
+        // A start with nothing to tell by (a menu of numbers and bars), then
+        // the page: the first sample can't say, the middle can.
+        let menu = "| 1 | 2 | 3 | 4 | 5 | ".repeat(60);
+        assert!(menu.chars().count() > SAMPLE_CHARS);
+        assert_eq!(detect(None, &menu), None);
+        let page = format!("{menu}{}", german.repeat(40));
+        assert_eq!(detect(None, &page), Some("deu"));
+        // A long page: its middle, not its start or end.
+        let page = format!(
+            "{}{}{}",
+            menu.repeat(30),
+            german.repeat(200),
+            menu.repeat(30)
+        );
+        assert!(page.chars().count() > SECOND_SAMPLE_CHARS * 2);
+        assert_eq!(detect(None, &page), Some("deu"));
+    }
+
+    #[test]
+    fn middles() {
+        assert_eq!(middle("abcdefghij", 10, 4), "defg");
+        assert_eq!(middle("abc", 3, 4), "abc");
+        assert_eq!(middle("ünïcødé", 7, 3), "ïcø");
+        assert_eq!(middle("ünïcødé", 7, 7), "ünïcødé");
     }
 }
